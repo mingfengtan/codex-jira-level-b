@@ -1,0 +1,53 @@
+# YAML representation of a JSON Schema. Single source of truth for plan validation.
+# Use plan.schema.yaml for both local validation and Codex structured output.
+type: object
+additionalProperties: false
+required:
+- project
+- epics
+properties:
+  project:
+    type: string
+  epics:
+    type: array
+    items:
+      type: object
+      additionalProperties: false
+      required:
+      - id
+      - summary
+      - description
+      - tasks
+      properties:
+        id:
+          type: string
+        summary:
+          type: string
+        description:
+          type: string
+        tasks:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required:
+            - id
+            - summary
+            - description
+            - acceptance_criteria
+            - depends_on
+            properties:
+              id:
+                type: string
+              summary:
+                type: string
+              description:
+                type: string
+              acceptance_criteria:
+                type: array
+                items:
+                  type: string
+              depends_on:
+                type: array
+                items:
+                  type: string
