@@ -7,7 +7,7 @@ This repository is the **orchestrator**, not the game code. `REPO_PATH` in `.env
 - `project_brief.md`: complete product requirements and phase boundaries (P0/P1 now; P2/P3/P4 roadmap only).
 - `plan.schema.yaml`: authoritative YAML-form JSON Schema for local validation and Codex structured-output conversion.
 - `plan.example.game.yaml`: **illustrative** P0/P1 Epics/Stories/Tasks and dependency graph. It is **not applied by default**. Replace its `project` before applying if your Jira key differs.
-- `orchestrator.py`: generate a YAML plan, validate, sync Jira issues, implement one approved ticket, or combine steps in a scheduled `tick`.
+- `orchestrator.py`: generate a YAML plan, validate, sync Jira issues, implement one approved ticket, or combine steps in a scheduled `tick`. Execution jobs now survive quota exhaustion, exceptions, and many process restarts using durable checkpoints.
 - `AGENTS.example.md`: copy to application repository root as `AGENTS.md` and commit it to `main`.
 - `tests/`: isolated unit tests; no real Jira or GitHub credentials needed.
 
@@ -79,8 +79,61 @@ This requires an online host. Turn off cron or omit `--bootstrap` if you want to
 - `plan.example.game.yaml` contains a sample `project: AIDEV`: replace it with your actual `JIRA_PROJECT_KEY`. If using it instead of AI generation, copy to `plan.yaml`, validate, then bootstrap/apply.
 - Plan `type` can be `Task`, `Story` or `Bug`. Nested `subtasks` are created using Jira's actual subtask type ID. `priority` is a human-facing hint; change priority in Jira for queue ordering. Dependencies refer to stable plan IDs. Don't create dependency cycles.
 - Codex is instructed to avoid commits/pushes/Jira calls; the orchestrator owns remote operations. Protect the GitHub `main` branch with mandatory PR review and CI checks; approve and merge manually. Native Jira coding-agent triggers should not run on the same issues.
-- Failure transitions ticket to `Blocked`, logs the error and leaves any worktree for investigation. The local lock does not prevent duplicate workers on other hosts. After fixing a failed run, investigate worktree/branch/PR state before reauthorizing; initial MVP does **not** provide automatic retry recovery or automatic PR merge detection.
+- Quota failures keep the ticket `In Progress`, preserve worktree/session, and pause further Codex tickets until the cooldown expires. Ordinary errors receive bounded retries with backoff; unrecoverable/ambiguous conditions move into local `manual` state and the worker attempts to mark the Jira ticket `Blocked`. Existing worktrees are never automatically deleted after a failure.
+- The worker has automatic recovery (details below), but cannot guarantee recovery from every possible hardware failure, auth revocation, corrupted repository, or untracked external side effect. The local lock does not prevent workers on different hosts. There is no automatic PR merge detection.
 - A large feature, commercial payments, ads, internet downloads or platform releases should be decomposed into explicitly approved new phases—not smuggled into the initial plan.
+
+
+## Upgrade from the pre-recovery MVP (important)
+
+1. Disable your old cron/scheduled invocation temporarily. Back up the orchestrator directory **and** `WORKTREE_ROOT` (default `~/.codex-jira-worktrees`).
+2. Copy the new `orchestrator.py`, `README.md`, and tests from this ZIP into the existing orchestrator directory. Keep the existing `.env`, `project_brief.md`, `plan.yaml`, `plan.applied.json`, and app repository unchanged. You may add the optional retry variables shown in `.env.example`.
+3. Run `python3 -m pip install -r requirements.txt`, `python3 -m unittest discover -s tests -v`, then `python3 orchestrator.py status`.
+4. Test `python3 orchestrator.py once --dry-run` and `python3 orchestrator.py once` before re-enabling cron. Do not create a second worker on another machine pointing to the same repo/state root.
+
+**Recover an interrupted ticket from the old MVP:** The old version does not have a JSON checkpoint, so the upgraded scheduler cannot know the saved Codex thread. If an old worktree remains at `~/.codex-jira-worktrees/AIDEV-123` (use your own issue key), retain the worktree, branch and partial source. Keep the `codex-ready` label on the ticket. Explicitly adopt it with:
+
+```bash
+python3 orchestrator.py recover AIDEV-123 --adopt-worktree --retry-now
+```
+
+The adoption verifies the branch and starts a new Codex session instructed to inspect and continue the existing files; it never resets the checkout. If Jira currently shows `Blocked`, the command attempts a transition to `In Progress`. If the branch/worktree does not match, it refuses to proceed. Always inspect the worktree first.
+
+## Quota-aware pause and restart recovery
+
+The worker stores a restricted-permission JSON journal at:
+
+```text
+~/.codex-jira-worktrees/
+├── .worker.lock
+├── state/
+│   └── AIDEV-123.json        # stage, Codex session ID, retries, PR URL, timestamps
+├── logs/
+│   ├── AIDEV-123.log         # Codex event stream and test logs
+│   └── AIDEV-123.last.md
+└── AIDEV-123/                # isolated Git worktree until a PR is created
+```
+
+The worktree and journal **must be on persistent local storage**; don't place them in an automatically cleaned temporary directory. Never commit the state directory, credentials or logs. A single-host `flock` prevents overlapping scheduled invocations. The `codex` CLI's JSON event stream supplies an exact session ID for `codex exec resume <SESSION_ID>`; the worker does not use `--last` (which could continue another ticket).
+
+A retrying job is prioritized over new Ready tickets. If the failure is a **Codex quota limit**, the worker keeps the job in `codex` stage, leaves Jira `In Progress`, posts one quota comment, and waits `QUOTA_RETRY_SECONDS` (default 1800). When the scheduler next runs after the cooldown, it tries to resume the saved Codex session. Quota classification uses CLI error text and therefore is best-effort; the worker cannot directly query a precise quota reset timestamp. All newly selected tickets are paused while a quota-paused job exists.
+
+For unexpected CLI, Git, GitHub, test, or Jira errors, the same saved stage can be retried with capped exponential backoff. Failed test runs feed their output into the same Codex session for up to `MAX_TEST_REPAIRS` additional attempts. After `MAX_RETRIES` consecutive failures, a clearly unsafe operation, a removed authorization label, or a Git/PR conflict, the local stage becomes `manual`; the worker tries to move Jira to `Blocked` and leaves the files intact. Fix the underlying problem before manually reauthorizing a retry.
+
+```bash
+python3 orchestrator.py status
+python3 orchestrator.py once --dry-run
+python3 orchestrator.py once
+
+# After fixing an error, override the cooldown / manual stop explicitly:
+python3 orchestrator.py recover AIDEV-123 --retry-now
+```
+
+The scheduler will replay Git push, PR lookup/creation, Jira comments/transitions, and worktree cleanup when needed. It first checks whether an open PR already exists and whether the Jira comment marker was posted, reducing duplicates after crashes. If a PR has been closed/merged unexpectedly, it requests manual review instead of silently creating another. It refuses to erase worktrees or overwrite conflicting branches.
+
+**Process restarts:** SIGINT/SIGTERM stop supervised Codex/test subprocess groups and keep the checkpoint. After an abrupt kill/power failure, the next run detects any still-alive previous process group and avoids launching a duplicate. If a process is alive or its identity is uncertain, inspect it before retrying. Hardware loss, broken Git state, lost Codex session records, missing credentials, or ambiguous external operations may still require human intervention. Journaling is local, not a distributed job queue.
+
+**Scope:** This recovery system covers **ticket execution**. An interrupted initial `plan`/`bootstrap` generation is rerun at the next scheduled invocation (not a saved Codex planning session). Jira ticket creation retains the prior `plan.applied.json` mapping and its earlier small create-vs-save duplication window. Do not schedule `--bootstrap` unless you want ongoing plan synchronization.
 
 ## Validation and tests
 

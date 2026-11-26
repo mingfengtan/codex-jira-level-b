@@ -10,6 +10,10 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
+import signal
+import time
+from datetime import datetime, timedelta, timezone
 import subprocess
 import sys
 import tempfile
@@ -57,6 +61,10 @@ class Config:
     worktree_root: Path
     codex_timeout: int
     test_timeout: int
+    quota_retry_seconds: int = 1800
+    retry_base_seconds: int = 120
+    max_retries: int = 3
+    max_test_repairs: int = 2
 
     @staticmethod
     def from_env() -> "Config":
@@ -88,6 +96,10 @@ class Config:
             worktree_root=Path(os.getenv("WORKTREE_ROOT", "~/.codex-jira-worktrees")).expanduser().resolve(),
             codex_timeout=int(os.getenv("CODEX_TIMEOUT_SECONDS", "1800")),
             test_timeout=int(os.getenv("TEST_TIMEOUT_SECONDS", "600")),
+            quota_retry_seconds=max(60, int(os.getenv("QUOTA_RETRY_SECONDS", "1800"))),
+            retry_base_seconds=max(10, int(os.getenv("RETRY_BASE_SECONDS", "120"))),
+            max_retries=max(1, int(os.getenv("MAX_RETRIES", "3"))),
+            max_test_repairs=max(0, int(os.getenv("MAX_TEST_REPAIRS", "2"))),
         )
 
 
@@ -173,6 +185,18 @@ class Jira:
 
     def comment(self, key: str, message: str) -> None:
         self.call("POST", f"/issue/{key}/comment", {"body": adf(message[:12000])})
+
+    def has_comment_marker(self, key: str, marker: str) -> bool:
+        """Check existing comments so a crash during Jira sync cannot post twice."""
+        start = 0
+        while True:
+            reply = self.call("GET", f"/issue/{urllib.parse.quote(key)}/comment?startAt={start}&maxResults=100")
+            comments = reply.get("comments", [])
+            if any(marker in plain(comment.get("body")) for comment in comments):
+                return True
+            start += len(comments)
+            if not comments or start >= reply.get("total", start):
+                return False
 
     def create_issue(self, summary: str, description: str, issue_type: str,
                      parent: str | None = None, labels: list[str] | None = None) -> str:
@@ -420,85 +444,565 @@ def ensure_git_repo(cfg: Config) -> None:
         raise ValueError(f"REPO_PATH must be Git repository root: {actual}")
 
 
-def execute_ticket(cfg: Config, jira: Jira, issue: dict) -> None:
+# Recovery journal: one state file per Jira issue. All writes happen under the host lock.
+# Stages are *next actions*, which are designed to be repeatable after a process crash.
+STAGES = {"prepare", "codex", "verify", "commit", "push", "pr", "jira", "cleanup", "complete", "manual"}
+QUOTA_PATTERNS = (
+    r"(?:you(?:'|’)?ve\s+hit|reached|exceeded)\s+(?:your\s+)?(?:codex\s+)?(?:usage|rate|weekly|quota)\s+limit",
+    r"(?:usage|rate|weekly|quota)\s+limit\s+(?:reached|exceeded)",
+    r"(?:insufficient_quota|usage_limit_reached|rate_limit_exceeded|quota_exceeded)",
+    r"(?:too many requests|429).*?(?:quota|codex|rate|usage)",
+    r"(?:rate limit exceeded|out of credits|not enough credits)",
+)
+PERMANENT_PATTERNS = (
+    r"(?:401|403).*?(?:unauthorized|forbidden|permission)",
+    r"(?:authentication failed|permission denied|repository not found)",
+    r"(?:invalid api token|not logged in|please run codex login)",
+    r"(?:unsafe|refusing to commit|no jira transition|no file changes)",
+)
+
+
+class WorkerError(RuntimeError):
+    def __init__(self, message: str, kind: str = "transient"):
+        super().__init__(message)
+        self.kind = kind
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def instant() -> str:
+    return utcnow().isoformat(timespec="seconds")
+
+
+def valid_issue_key(key: str, cfg: Config) -> bool:
+    return bool(re.fullmatch(re.escape(cfg.project) + r"-[1-9][0-9]*", key))
+
+
+def state_folder(cfg: Config) -> Path:
+    directory = cfg.worktree_root / "state"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return directory
+
+
+def state_path(cfg: Config, key: str) -> Path:
+    if not valid_issue_key(key, cfg):
+        raise ValueError(f"Invalid issue key for project {cfg.project}: {key!r}")
+    return state_folder(cfg) / f"{key}.json"
+
+
+def persist_job(cfg: Config, job: dict) -> None:
+    """Atomically checkpoint state, including after Codex announces its thread ID."""
+    path = state_path(cfg, job["key"])
+    job["updated_at"] = instant()
+    fd, temporary = tempfile.mkstemp(prefix=".state-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            json.dump(job, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def load_job(cfg: Config, key: str) -> dict | None:
+    path = state_path(cfg, key)
+    if not path.exists():
+        return None
+    job = json.loads(path.read_text(encoding="utf-8"))
+    if job.get("key") != key or job.get("stage") not in STAGES or job.get("version") != 1:
+        raise WorkerError(f"Invalid recovery state at {path}", "manual")
+    if job.get("repo") != str(cfg.repo) or job.get("base_branch") != cfg.base_branch:
+        raise WorkerError(f"Repository/base changed since {key} began; inspect {path}", "manual")
+    return job
+
+
+def new_job(cfg: Config, issue: dict, *, adopted: bool = False) -> dict:
     key = issue["key"]
-    fields = issue["fields"]
-    title = fields["summary"]
-    description = plain(fields.get("description"))
+    if not valid_issue_key(key, cfg):
+        raise ValueError(f"Unexpected Jira key {key!r}")
+    return {
+        "version": 1, "key": key, "stage": "codex" if adopted else "prepare",
+        "repo": str(cfg.repo), "base_branch": cfg.base_branch,
+        "branch": f"codex/{key}", "worktree": str(cfg.worktree_root / key),
+        "session_id": None, "attempts": 0, "codex_attempts": 0,
+        "codex_complete": False, "active_pid": None, "active_kind": None,
+        "verify_repairs": 0, "next_retry_at": None,
+        "failure_kind": None, "last_error": None,
+        "pr_url": None, "comment_marker": None,
+        "repair_context": None, "adopted": adopted,
+        "started_at": instant(), "updated_at": instant(),
+    }
+
+
+def pause_due(job: dict) -> bool:
+    timestamp = job.get("next_retry_at")
+    return not timestamp or utcnow() >= datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+
+
+def backoff_seconds(kind: str, attempts: int, cfg: Config) -> int:
+    if kind == "quota":
+        return cfg.quota_retry_seconds
+    return min(cfg.retry_base_seconds * (2 ** max(0, attempts - 1)), 3600)
+
+
+def classify_failure(message: str) -> str:
+    if any(re.search(p, message, flags=re.I | re.S) for p in QUOTA_PATTERNS):
+        return "quota"
+    if any(re.search(p, message, flags=re.I | re.S) for p in PERMANENT_PATTERNS):
+        return "manual"
+    return "transient"
+
+
+def schedule_failure(cfg: Config, job: dict, exc: Exception) -> None:
+    category = exc.kind if isinstance(exc, WorkerError) else classify_failure(str(exc))
+    job["attempts"] += 1
+    job["failure_kind"] = category
+    job["last_error"] = str(exc)[-2500:]
+    if category == "manual" or (category != "quota" and job["attempts"] >= cfg.max_retries):
+        job["resume_stage"] = job["stage"]
+        job["stage"] = "manual"
+        job["next_retry_at"] = None
+        print(f"{job['key']} needs human intervention: {exc}", file=sys.stderr)
+    else:
+        delay = backoff_seconds(category, job["attempts"], cfg)
+        job["next_retry_at"] = (utcnow() + timedelta(seconds=delay)).isoformat(timespec="seconds")
+        print(f"{job['key']} paused ({category}), retry no sooner than {job['next_retry_at']}", file=sys.stderr)
+    persist_job(cfg, job)
+
+
+def advance(cfg: Config, job: dict, next_stage: str) -> None:
+    job["stage"] = next_stage
+    job["failure_kind"] = None
+    job["last_error"] = None
+    job["next_retry_at"] = None
+    job["attempts"] = 0
+    persist_job(cfg, job)
+
+
+def issue_status(issue: dict) -> str:
+    return issue.get("fields", {}).get("status", {}).get("name", "")
+
+
+def require_authorization(cfg: Config, issue: dict, job: dict) -> None:
+    current = issue_status(issue).casefold()
+    if current == cfg.review_status.casefold() and job["stage"] in {"jira", "cleanup", "complete"}:
+        return
+    if current == "done" or issue.get("fields", {}).get("status", {}).get("statusCategory", {}).get("key") == "done":
+        raise WorkerError("Ticket is Done; refusing further automation", "manual")
+    if job["stage"] in {"prepare", "codex", "verify", "commit", "push", "pr"}:
+        if cfg.ready_label not in issue.get("fields", {}).get("labels", []):
+            raise WorkerError(f"Authorization label {cfg.ready_label} was removed", "manual")
+        allowed = {cfg.ready_status.casefold(), cfg.in_progress_status.casefold()}
+        if current and current not in allowed:
+            raise WorkerError(f"Unexpected Jira status {issue_status(issue)!r}; refusing automation", "manual")
+
+
+def ensure_worktree(cfg: Config, job: dict) -> None:
+    worktree = Path(job["worktree"])
+    branch = job["branch"]
+    if worktree.exists():
+        actual = run_command(["git", "-C", str(worktree), "branch", "--show-current"])
+        toplevel = Path(run_command(["git", "-C", str(worktree), "rev-parse", "--show-toplevel"]))
+        if actual != branch or toplevel.resolve() != worktree.resolve():
+            raise WorkerError(f"Worktree {worktree} does not match expected branch {branch}", "manual")
+        return
+    run_command(["git", "-C", str(cfg.repo), "fetch", "origin", cfg.base_branch], timeout=180)
+    # A branch without its worktree is suspicious; never reset or overwrite it.
+    existing = subprocess.run(["git", "-C", str(cfg.repo), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if existing.returncode == 0:
+        raise WorkerError(f"Branch {branch} exists without its saved worktree; inspect manually", "manual")
+    run_command(["git", "-C", str(cfg.repo), "worktree", "add", "-b", branch,
+                 str(worktree), f"origin/{cfg.base_branch}"])
+
+
+def terminate_group(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=4)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=4)
+
+
+def run_codex_stream(cfg: Config, job: dict, prompt: str, log: Path, last_message: Path) -> None:
+    worktree = Path(job["worktree"])
+    args = codex_args(worktree) + ["--json", "--output-last-message", str(last_message)]
+    if job.get("session_id"):
+        args += ["resume", job["session_id"], prompt]
+    else:
+        args.append(prompt)
+    worktree = Path(job["worktree"])
+    proc = subprocess.Popen(args, cwd=worktree, env=safe_env(), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+    job["active_pid"] = proc.pid
+    job["active_kind"] = "codex"
+    persist_job(cfg, job)
+    deadline = time.monotonic() + cfg.codex_timeout
+    tail = bytearray()
+    buffered = bytearray()
+    failed_event = False
+    try:
+        selector = selectors.DefaultSelector()
+        with selector, log.open("ab") as output:
+            output.write(f"\n--- CODEX {instant()} ---\n".encode())
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            while True:
+                if time.monotonic() > deadline:
+                    raise WorkerError(f"Codex timeout after {cfg.codex_timeout}s; logs: {log}", "transient")
+                for _key, _mask in selector.select(timeout=0.3):
+                    chunk = os.read(proc.stdout.fileno(), 65536)
+                    if not chunk:
+                        selector.unregister(proc.stdout)
+                        continue
+                    output.write(chunk)
+                    output.flush()
+                    tail.extend(chunk)
+                    if len(tail) > 16000:
+                        del tail[:-16000]
+                    buffered.extend(chunk)
+                    if len(buffered) > 1000000:
+                        buffered = buffered[-16000:]
+                    while b"\n" in buffered:
+                        raw, _, remainder = buffered.partition(b"\n")
+                        buffered = bytearray(remainder)
+                        try:
+                            event = json.loads(raw)
+                        except (ValueError, UnicodeDecodeError):
+                            continue
+                        if event.get("type") == "thread.started" and event.get("thread_id"):
+                            new_id = event["thread_id"]
+                            if job.get("session_id") != new_id:
+                                job["session_id"] = new_id
+                                persist_job(cfg, job)
+                        if event.get("type") == "turn.completed":
+                            job["codex_complete"] = True
+                            persist_job(cfg, job)
+                        if event.get("type") in {"turn.failed", "error"}:
+                            failed_event = True
+                if proc.poll() is not None and not selector.get_map():
+                    break
+            output.flush()
+        output_text = tail.decode("utf-8", errors="replace")
+        if proc.wait() != 0 or failed_event:
+            job["codex_complete"] = False
+            persist_job(cfg, job)
+            category = classify_failure(output_text)
+            raise WorkerError(f"Codex exited unsuccessfully ({proc.returncode}, event_failure={failed_event}). "
+                              f"See {log}. Recent output: {output_text[-1400:]}", category)
+    except BaseException:
+        terminate_group(proc)
+        raise
+    finally:
+        if proc.stdout:
+            proc.stdout.close()
+        job["active_pid"] = None
+        job["active_kind"] = None
+        persist_job(cfg, job)
+
+
+def verify_tests(cfg: Config, job: dict, log: Path) -> None:
+    process = subprocess.Popen(["bash", "-lc", cfg.check_command], cwd=job["worktree"],
+                               env=safe_env(), stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               start_new_session=True)
+    job["active_pid"] = process.pid
+    job["active_kind"] = "verification"
+    persist_job(cfg, job)
+    try:
+        output, _ = process.communicate(timeout=cfg.test_timeout)
+    except BaseException:
+        terminate_group(process)
+        raise
+    finally:
+        job["active_pid"] = None
+        job["active_kind"] = None
+        persist_job(cfg, job)
+    with log.open("ab") as stream:
+        stream.write(f"\n--- VERIFICATION {instant()} ---\n".encode() + output[-200000:])
+    if process.returncode:
+        context = output.decode("utf-8", errors="replace")[-6000:]
+        job["verify_repairs"] += 1
+        job["repair_context"] = context
+        if job["verify_repairs"] > cfg.max_test_repairs:
+            raise WorkerError(f"Verification failed {job['verify_repairs']} times; inspect {log}", "manual")
+        job["stage"] = "codex"
+        job["codex_complete"] = False
+        persist_job(cfg, job)
+        raise WorkerError(f"Verification failed; Codex will attempt repair. See {log}", "transient")
+
+
+def git_commits_ahead(cfg: Config, job: dict) -> list[str]:
+    output = run_command(["git", "-C", job["worktree"], "log", "--format=%s", f"origin/{cfg.base_branch}..HEAD"])
+    return output.splitlines() if output else []
+
+
+def commit_if_needed(cfg: Config, job: dict, title: str) -> None:
+    worktree = job["worktree"]
+    ahead = git_commits_ahead(cfg, job)
+    if ahead:
+        if len(ahead) != 1 or not ahead[0].startswith(f"{job['key']}:"):
+            raise WorkerError(f"Unexpected commits on {job['branch']}: {ahead}; inspect manually", "manual")
+        status = run_command(["git", "-C", worktree, "status", "--porcelain"])
+        if status:
+            raise WorkerError("Commits exist but worktree has additional changes; inspect manually", "manual")
+        return
+    run_command(["git", "-C", worktree, "add", "-A"])
+    staged = run_command(["git", "-C", worktree, "diff", "--cached", "--name-only"])
+    if not staged:
+        raise WorkerError("Codex completed but produced no file changes", "manual")
+    forbidden = [name for name in staged.splitlines() if re.search(
+        r"(^|/)(\.env($|\.)|id_rsa$|id_ed25519$)|\.(pem|p12|pfx|key)$", name, re.I)]
+    if forbidden:
+        raise WorkerError(f"Refusing to commit possible secrets: {forbidden}", "manual")
+    run_command(["git", "-C", worktree, "commit", "-m", f"{job['key']}: {title[:70]}"])
+
+
+def existing_pr(cfg: Config, job: dict) -> str | None:
+    data = run_command(["gh", "pr", "list", "--head", job["branch"], "--state", "all",
+                        "--json", "url,state", "--limit", "100"], cwd=Path(job["worktree"]), timeout=120)
+    prs = json.loads(data)
+    if len(prs) > 1:
+        raise WorkerError(f"Multiple PRs for branch {job['branch']}; review manually", "manual")
+    if not prs:
+        return None
+    if prs[0]["state"].upper() != "OPEN":
+        raise WorkerError(f"PR is {prs[0]['state']}: {prs[0]['url']}; will not recreate", "manual")
+    return prs[0]["url"]
+
+
+def ensure_pr(cfg: Config, job: dict, title: str, last_message: Path) -> str:
+    found = existing_pr(cfg, job)
+    if found:
+        return found
+    summary = last_message.read_text(encoding="utf-8")[:3500] if last_message.exists() else ""
+    issue_url = f"{cfg.url}/browse/{job['key']}"
+    body = f"Jira: {issue_url}\n\nAutomated implementation; human review required.\n\n{summary}"
+    result = run_command(["gh", "pr", "create", "--draft", "--base", cfg.base_branch,
+                          "--head", job["branch"], "--title", f"{job['key']}: {title[:110]}",
+                          "--body", body], cwd=Path(job["worktree"]), timeout=120)
+    return result.splitlines()[-1]
+
+
+def jira_finalize(cfg: Config, jira: Jira, job: dict) -> None:
+    marker = f"codex-jira:{job['key']}:pr"
+    if not jira.has_comment_marker(job["key"], marker):
+        jira.comment(job["key"], f"[{marker}]\nCodex implementation ready for human review.\n"
+                     f"Draft PR: {job['pr_url']}\nVerification: {cfg.check_command}")
+    current = issue_status(jira.issue(job["key"]))
+    if current.casefold() != cfg.review_status.casefold():
+        jira.transition(job["key"], cfg.review_status)
+
+
+def note_paused_job(cfg: Config, jira: Jira, job: dict) -> None:
+    """Best-effort Jira visibility; failures never overwrite the local recovery journal."""
+    if job.get("failure_kind") == "quota":
+        marker = f"codex-jira:{job['key']}:quota"
+        if not jira.has_comment_marker(job["key"], marker):
+            jira.comment(job["key"], f"[{marker}]\nCodex usage limit reached. The local worker "
+                         f"will retry no sooner than {job['next_retry_at']} and resume saved work.")
+    elif job["stage"] == "manual":
+        marker = f"codex-jira:{job['key']}:manual"
+        if not jira.has_comment_marker(job["key"], marker):
+            jira.comment(job["key"], f"[{marker}]\nWorker requires human intervention. "
+                         f"Saved stage: {job.get('resume_stage')}.\n"
+                         "Inspect the restricted local worker logs for error details.\n"
+                         f"Use `python3 orchestrator.py status` and `recover {job['key']} --retry-now` "
+                         "after investigating.")
+        current = issue_status(jira.issue(job["key"]))
+        if current.casefold() not in {cfg.blocked_status.casefold(), cfg.review_status.casefold(), "done"}:
+            jira.transition(job["key"], cfg.blocked_status)
+
+
+def safely_note_pause(cfg: Config, jira: Jira, job: dict) -> None:
+    try:
+        note_paused_job(cfg, jira, job)
+    except Exception as exc:
+        print(f"Could not annotate Jira for {job['key']}: {exc}", file=sys.stderr)
+
+
+def run_saved_job(cfg: Config, jira: Jira, job: dict) -> None:
+    key = job["key"]
+    if job["stage"] in {"complete", "manual"}:
+        print(f"{key}: state is {job['stage']}; no automatic work")
+        return
+    if not pause_due(job):
+        print(f"{key}: {job['failure_kind']} pause until {job['next_retry_at']}")
+        return
+    issue = jira.issue(key)
+    try:
+        require_authorization(cfg, issue, job)
+    except WorkerError as exc:
+        schedule_failure(cfg, job, exc)
+        safely_note_pause(cfg, jira, job)
+        return
+    old_pid = job.get("active_pid")
+    if old_pid is not None:
+        try:
+            os.killpg(int(old_pid), 0)
+        except ProcessLookupError:
+            job["active_pid"] = None
+            job["active_kind"] = None
+            persist_job(cfg, job)
+        else:
+            schedule_failure(cfg, job, WorkerError(
+                f"Previous {job.get('active_kind')} process group {old_pid} still exists. "
+                "Refusing concurrent work on the same checkout.", "transient"))
+            safely_note_pause(cfg, jira, job)
+            return
+    title = issue["fields"]["summary"]
+    description = plain(issue["fields"].get("description"))
     root = cfg.worktree_root
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
     logs = root / "logs"
-    logs.mkdir(mode=0o700, exist_ok=True)
-    worktree = root / key
-    branch = f"codex/{key}"
-    issue_url = f"{cfg.url}/browse/{key}"
+    logs.mkdir(parents=True, exist_ok=True, mode=0o700)
     log = logs / f"{key}.log"
     last_message = logs / f"{key}.last.md"
-    jira.transition(key, cfg.in_progress_status)
-    try:
-        run_command(["git", "-C", str(cfg.repo), "fetch", "origin", cfg.base_branch], timeout=180)
-        if worktree.exists():
-            raise RuntimeError(f"Existing worktree at {worktree}; investigate before retry")
-        run_command(["git", "-C", str(cfg.repo), "worktree", "add", "-b", branch,
-                     str(worktree), f"origin/{cfg.base_branch}"])
-        prompt = f"""Implement Jira {key} in this repository.
+    prompt = f"""Implement Jira {key} in this repository.
 Title: {title}
 Description and acceptance criteria:\n{description[:30000]}
-Jira: {issue_url}
+Jira: {cfg.url}/browse/{key}
 
-Follow AGENTS.md and repository conventions. Implement the smallest coherent change.
-Add or update meaningful tests. Run relevant tests if tools permit.
-Do NOT create a git commit, change branches, push, open PRs, contact Jira,
-or modify files outside this workspace. Never access or print secrets.
-If the task is ambiguous or unsafe, do not improvise; state blockers.
-End with a concise summary of changes, tests, and any outstanding risks.
+Inspect existing files and git status before changing anything. Preserve any partial
+changes from previous interrupted attempts; do not duplicate or erase completed work.
+Follow AGENTS.md. Implement the smallest coherent change and add meaningful tests.
+Do NOT commit, push, open a PR, contact Jira or modify files outside this workspace.
+Never access or print secrets. If ambiguous, state blockers rather than guessing.
+End with a concise summary, tests and outstanding risks.
 """
-        cmd = codex_args(worktree) + ["--output-last-message", str(last_message), prompt]
-        completed = subprocess.run(cmd, cwd=worktree, env=safe_env(),
-                                   stdin=subprocess.DEVNULL, capture_output=True,
-                                   text=True, timeout=cfg.codex_timeout)
-        log.write_text(completed.stdout + "\n--- STDERR ---\n" + completed.stderr, encoding="utf-8")
-        if completed.returncode != 0:
-            raise RuntimeError(f"Codex failed with exit {completed.returncode}; inspect {log}")
-        print(f"Running configured verification: {cfg.check_command}")
-        # CHECK_COMMAND is supplied by the operator in .env, never by Jira or Codex.
-        verification = subprocess.run(["bash", "-lc", cfg.check_command], cwd=worktree,
-                                      env=safe_env(), capture_output=True, text=True,
-                                      timeout=cfg.test_timeout)
-        with log.open("a", encoding="utf-8") as out:
-            out.write("\n--- VERIFICATION ---\n" + verification.stdout + "\n" + verification.stderr)
-        if verification.returncode:
-            raise RuntimeError(f"CHECK_COMMAND failed; inspect {log}")
-        run_command(["git", "-C", str(worktree), "add", "-A"])
-        staged = run_command(["git", "-C", str(worktree), "diff", "--cached", "--name-only"])
-        if not staged:
-            raise RuntimeError("Codex completed but produced no file changes")
-        forbidden = [name for name in staged.splitlines() if
-                     re.search(r"(^|/)(\.env($|\.)|id_rsa$|id_ed25519$)|\.(pem|p12|pfx|key)$", name, re.I)]
-        if forbidden:
-            raise RuntimeError(f"Refusing to commit possible secrets: {forbidden}")
-        run_command(["git", "-C", str(worktree), "commit", "-m", f"{key}: {title[:70]}"])
-        run_command(["git", "-C", str(worktree), "push", "-u", "origin", branch], timeout=180)
-        summary = last_message.read_text(encoding="utf-8")[:3500] if last_message.exists() else ""
-        pr_body = f"Jira: {issue_url}\n\nAutomated implementation; human review required.\n\n{summary}"
-        pr_url = run_command(["gh", "pr", "create", "--draft", "--base", cfg.base_branch,
-                              "--head", branch, "--title", f"{key}: {title[:110]}",
-                              "--body", pr_body], cwd=worktree, timeout=120).splitlines()[-1]
-        jira.comment(key, f"Codex implementation is ready for review.\nDraft PR: {pr_url}\nConfigured verification passed: {cfg.check_command}")
-        jira.transition(key, cfg.review_status)
-        print(f"Created draft PR: {pr_url}\nJira: {issue_url} now {cfg.review_status}")
-        run_command(["git", "-C", str(cfg.repo), "worktree", "remove", "--force", str(worktree)])
+    try:
+        while job["stage"] not in {"complete", "manual"}:
+            phase = job["stage"]
+            if phase == "prepare":
+                current = issue_status(issue)
+                if current.casefold() != cfg.in_progress_status.casefold():
+                    jira.transition(key, cfg.in_progress_status)
+                ensure_worktree(cfg, job)
+                advance(cfg, job, "codex")
+            elif phase == "codex":
+                ensure_worktree(cfg, job)
+                if job.get("codex_complete"):
+                    advance(cfg, job, "verify")
+                    continue
+                job["codex_attempts"] += 1
+                persist_job(cfg, job)
+                continuation = prompt
+                if job.get("session_id"):
+                    continuation = (f"Continue working on Jira {key}. Inspect existing changes and finish acceptance criteria. "
+                                    "Preserve previous work; do not commit, push, or open PRs.\n" +
+                                    ("Fix these verification failures:\n" + job["repair_context"]
+                                     if job.get("repair_context") else "Review status and resume unfinished implementation."))
+                elif job["codex_attempts"] > 1 or job.get("adopted"):
+                    continuation += "\nThis worktree contains earlier partial work; inspect it and continue, do not restart."
+                    if job.get("repair_context"):
+                        continuation += "\nFix these verification failures:\n" + job["repair_context"]
+                run_codex_stream(cfg, job, continuation, log, last_message)
+                job["repair_context"] = None
+                advance(cfg, job, "verify")
+            elif phase == "verify":
+                verify_tests(cfg, job, log)
+                advance(cfg, job, "commit")
+            elif phase == "commit":
+                commit_if_needed(cfg, job, title)
+                advance(cfg, job, "push")
+            elif phase == "push":
+                run_command(["git", "-C", job["worktree"], "push", "-u", "origin", job["branch"]], timeout=180)
+                advance(cfg, job, "pr")
+            elif phase == "pr":
+                job["pr_url"] = ensure_pr(cfg, job, title, last_message)
+                advance(cfg, job, "jira")
+            elif phase == "jira":
+                if not job.get("pr_url"):
+                    # Recover from a crash after PR creation but before state persistence.
+                    job["pr_url"] = existing_pr(cfg, job)
+                    if not job["pr_url"]:
+                        raise WorkerError("Missing PR URL for Jira finalization", "manual")
+                    persist_job(cfg, job)
+                jira_finalize(cfg, jira, job)
+                advance(cfg, job, "cleanup")
+            elif phase == "cleanup":
+                worktree = Path(job["worktree"])
+                if worktree.exists():
+                    # No --force: leave any unexpected modifications for investigation.
+                    run_command(["git", "-C", str(cfg.repo), "worktree", "remove", str(worktree)])
+                advance(cfg, job, "complete")
+                print(f"Completed {key}: {job['pr_url']} (Jira in review)")
+            else:
+                raise WorkerError(f"Unknown stage {phase!r}", "manual")
     except Exception as exc:
-        print(f"Failed on {key}: {exc}", file=sys.stderr)
-        try:
-            jira.comment(key, f"Codex worker stopped: {str(exc)[:1500]}\nManual intervention needed.\nWorktree (if created): {worktree}")
-            try:
-                jira.transition(key, cfg.blocked_status)
-            except Exception as status_error:
-                print(f"Could not transition to {cfg.blocked_status}: {status_error}", file=sys.stderr)
-        except Exception as comment_error:
-            print(f"Could not write failure to Jira: {comment_error}", file=sys.stderr)
+        schedule_failure(cfg, job, exc)
+        safely_note_pause(cfg, jira, job)
+    except (KeyboardInterrupt, SystemExit):
+        # The already-persisted stage is safe for the next invocation to replay.
+        persist_job(cfg, job)
         raise
+
+
+def all_jobs(cfg: Config) -> list[dict]:
+    result = []
+    for path in sorted(state_folder(cfg).glob("*.json")):
+        if not valid_issue_key(path.stem, cfg):
+            continue
+        result.append(load_job(cfg, path.stem))
+    return result
+
+
+def show_jobs(cfg: Config) -> None:
+    jobs = all_jobs(cfg)
+    if not jobs:
+        print("No recorded worker jobs")
+    for job in jobs:
+        suffix = f", retry={job['next_retry_at']}" if job.get("next_retry_at") else ""
+        print(f"{job['key']}: stage={job['stage']}, failure={job.get('failure_kind')}, "
+              f"session={job.get('session_id') or '-'}, attempts={job['attempts']}{suffix}")
+
+
+def recover_job(cfg: Config, key: str, *, retry_now: bool = False, adopt_worktree: bool = False) -> None:
+    with single_worker_lock(cfg.worktree_root):
+        jira = Jira(cfg)
+        issue = jira.issue(key)
+        job = load_job(cfg, key)
+        if adopt_worktree:
+            if job:
+                raise ValueError(f"{key} already has persisted state; omit --adopt-worktree")
+            if cfg.ready_label not in issue.get("fields", {}).get("labels", []):
+                raise ValueError(f"Add {cfg.ready_label} label before adopting")
+            job = new_job(cfg, issue, adopted=True)
+            worktree = Path(job["worktree"])
+            if not worktree.exists():
+                raise ValueError(f"No old worktree at {worktree}")
+            ensure_worktree(cfg, job)
+            if issue_status(issue).casefold() == cfg.blocked_status.casefold():
+                jira.transition(key, cfg.in_progress_status)
+            persist_job(cfg, job)
+            print(f"Adopted {key}; first run will inspect existing partial source changes")
+        elif not job:
+            raise ValueError(f"No saved job for {key}; use --adopt-worktree only for an old worker checkout")
+        if retry_now:
+            if job["stage"] == "complete":
+                raise ValueError("Completed job cannot be retried")
+            if job["stage"] == "manual":
+                job["stage"] = job.pop("resume_stage", "codex")
+                if job["stage"] in {"codex", "verify", "commit", "push", "pr"} and \
+                   issue_status(issue).casefold() == cfg.blocked_status.casefold():
+                    jira.transition(key, cfg.in_progress_status)
+            job["attempts"] = 0
+            job["next_retry_at"] = None
+            job["failure_kind"] = None
+            persist_job(cfg, job)
+            print(f"Retry authorized: {key} at stage {job['stage']}")
+        run_saved_job(cfg, jira, job)
 
 
 @contextlib.contextmanager
@@ -513,34 +1017,65 @@ def single_worker_lock(root: Path):
 
 
 def once(cfg: Config, dry_run: bool = False, already_locked: bool = False) -> None:
+    """Resume an interrupted job first, otherwise claim one authorized Ready task."""
     ensure_git_repo(cfg)
     jira = Jira(cfg)
     lock = contextlib.nullcontext() if already_locked else single_worker_lock(cfg.worktree_root)
     with lock:
+        jobs = all_jobs(cfg)
+        # Quota exhaustion is account-wide. Do not start new tickets while waiting.
+        quota_jobs = [job for job in jobs if job.get("failure_kind") == "quota"
+                      and job["stage"] not in {"manual", "complete"}]
+        if quota_jobs:
+            job = sorted(quota_jobs, key=lambda x: x["updated_at"])[0]
+            if dry_run:
+                print(f"DRY RUN: quota-paused {job['key']}, next retry {job['next_retry_at']}")
+                return
+            run_saved_job(cfg, jira, job)
+            return
+        pending = [job for job in jobs if job["stage"] not in {"manual", "complete"}]
+        due = [job for job in pending if pause_due(job)]
+        if due:
+            job = sorted(due, key=lambda x: x["updated_at"])[0]
+            if dry_run:
+                print(f"DRY RUN: would resume {job['key']} at stage {job['stage']}")
+                return
+            run_saved_job(cfg, jira, job)
+            return
         candidates = jira.ready_issues()
         if not candidates:
-            print("No Ready + codex-ready tasks")
+            print("No Ready + codex-ready tickets; no due recovery jobs")
             return
         for candidate in candidates:
-            issue = jira.issue(candidate["key"])
+            key = candidate["key"]
+            if load_job(cfg, key):
+                continue  # Never run a recorded job as a new ticket.
+            issue = jira.issue(key)
             fields = issue["fields"]
             if fields.get("issuetype", {}).get("name", "").casefold() not in {
                 "task", "story", "bug", "sub-task", "subtask"
             }:
                 continue
             if fields.get("subtasks"):
-                print(f"Skipping {issue['key']}: parent has subtasks")
+                print(f"Skipping {key}: parent has subtasks")
                 continue
             if not jira.dependencies_satisfied(issue):
-                print(f"Skipping {issue['key']}: blocked by dependency")
+                print(f"Skipping {key}: blocked by dependency")
                 continue
             if dry_run:
-                print(f"DRY RUN: would implement {issue['key']}: {fields['summary']}")
+                print(f"DRY RUN: would implement {key}: {fields['summary']}")
                 return
-            execute_ticket(cfg, jira, issue)
+            job = new_job(cfg, issue)
+            if Path(job["worktree"]).exists():
+                raise WorkerError(f"Existing untracked worktree {job['worktree']}; "
+                                  f"use recover {key} --adopt-worktree explicitly", "manual")
+            persist_job(cfg, job)  # Checkpoint before changing Jira or Git.
+            run_saved_job(cfg, jira, job)
             return
-        print("No unblocked executable tickets in first 50 results")
-
+        if pending:
+            print("No recovery job due yet; no other unclaimed executable ticket")
+        else:
+            print("No unblocked executable tickets in first 50 results")
 
 def bootstrap(cfg: Config, brief_path: Path, plan_path: Path) -> None:
     """Generate plan if absent and sync it to Jira, without authorization."""
@@ -558,6 +1093,8 @@ def bootstrap(cfg: Config, brief_path: Path, plan_path: Path) -> None:
 
 def main() -> None:
     os.umask(0o077)
+    # Graceful SIGTERM lets Codex/test process groups stop, preserving checkpoints.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     load_env()
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -580,6 +1117,11 @@ def main() -> None:
     tick_parser.add_argument("--brief", type=Path, default=ROOT / "project_brief.md")
     tick_parser.add_argument("--plan", type=Path, default=ROOT / "plan.yaml")
     tick_parser.add_argument("--dry-run", action="store_true", help="Read-only; never bootstrap")
+    sub.add_parser("status", help="Show durable execution checkpoints and retry times")
+    recover_parser = sub.add_parser("recover", help="Resume a paused job or adopt a pre-upgrade worktree")
+    recover_parser.add_argument("issue_key", help="Jira key, e.g. AIDEV-12")
+    recover_parser.add_argument("--retry-now", action="store_true", help="Clear cooldown or manual stop")
+    recover_parser.add_argument("--adopt-worktree", action="store_true", help="Explicitly adopt old MVP partial worktree")
     args = parser.parse_args()
     if args.command == "validate-plan":
         project = os.getenv("JIRA_PROJECT_KEY", "").strip()
@@ -604,6 +1146,10 @@ def main() -> None:
             parser.error("bootstrap writes Jira tickets; add --yes after choosing this mode")
         with single_worker_lock(cfg.worktree_root):
             bootstrap(cfg, args.brief, args.plan)
+    elif args.command == "status":
+        show_jobs(cfg)
+    elif args.command == "recover":
+        recover_job(cfg, args.issue_key, retry_now=args.retry_now, adopt_worktree=args.adopt_worktree)
     elif args.command == "tick":
         with single_worker_lock(cfg.worktree_root):
             if args.bootstrap and not args.dry_run:
@@ -614,6 +1160,9 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except KeyboardInterrupt:
+        print("Interrupted. Durable job checkpoint is preserved for the next run.", file=sys.stderr)
+        sys.exit(130)
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)

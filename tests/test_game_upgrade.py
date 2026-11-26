@@ -94,7 +94,7 @@ class TestGameUpgrade(unittest.TestCase):
                 return {'key':key,'fields':{'summary':key,'issuetype':{'name':'Story'},
                     'subtasks':[{'key':'AIDEV-9'}] if key.endswith('1') else []}}
             def dependencies_satisfied(self,issue): return True
-        cfg=SimpleNamespace(repo=self.root,worktree_root=self.root)
+        cfg=SimpleNamespace(repo=self.root,worktree_root=self.root,project='AIDEV')
         with patch('orchestrator.ensure_git_repo'),patch('orchestrator.Jira',FakeJira):
             with patch('builtins.print') as pr:
                 once(cfg,True)
