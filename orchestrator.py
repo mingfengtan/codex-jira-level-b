@@ -243,8 +243,13 @@ def run_command(args: list[str], cwd: Path | None = None, timeout: int = 120,
 
 
 def codex_args(repo: Path, sandbox: str = "workspace-write") -> list[str]:
-    return ["codex", "exec", "-C", str(repo), "--sandbox", sandbox,
-            "--ask-for-approval", "never",
+    # The Codex exec subcommand does not accept --ask-for-approval after exec.
+    # Keep the CLI executable explicit so a Python venv cannot shadow it with
+    # another application named `codex`.
+    codex_bin = os.getenv("OPENAI_CODEX_BIN", "codex").strip()
+    if not codex_bin:
+        raise ValueError("OPENAI_CODEX_BIN cannot be empty")
+    return [codex_bin, "exec", "-C", str(repo), "--sandbox", sandbox,
             "-c", "mcp_servers.atlassian.enabled=false"]
 
 

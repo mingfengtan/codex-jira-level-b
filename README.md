@@ -144,3 +144,14 @@ python3 orchestrator.py --help
 ```
 
 Run `flutter doctor -v` and platform smoke tests separately; the Python tests do not create tickets, run Codex or exercise a real Flutter project.
+
+
+## Codex CLI executable and approval flag (macOS)
+
+If `codex` in a Python virtual environment starts an unrelated app, set
+`OPENAI_CODEX_BIN=/opt/homebrew/bin/codex` in the **orchestrator** `.env`.
+Verify with `/opt/homebrew/bin/codex --version` (expected: `codex-cli ...`).
+This release also removes `--ask-for-approval never` from `codex exec`
+because Codex CLI 0.172.0 rejects that argument when placed after `exec`.
+Noninteractive `exec` uses noninteractive approval behavior and the configured
+`--sandbox` restriction; do not use the dangerous bypass flags.
