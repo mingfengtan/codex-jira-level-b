@@ -490,7 +490,7 @@ def apply_plan(cfg: Config, plan_path: Path) -> None:
 
 def ensure_git_repo(cfg: Config) -> None:
     actual = Path(run_command(["git", "-C", str(cfg.repo), "rev-parse", "--show-toplevel"])).resolve()
-    if actual != cfg.repo:
+    if actual != cfg.repo.resolve():
         raise ValueError(f"REPO_PATH must be Git repository root: {actual}")
 
 
