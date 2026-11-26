@@ -1,0 +1,83 @@
+# UI , Multi-project and Project Data Persistence
+## UI
+
+For the aiassitant scheduler, instead of command line, adding UI would be convinient for user
+
+### New project creation
+- Better to across platform(linux, macos ,windows etc), local web + sqllite is also fine.
+- User can create a new project
+- User can auth  github and jira for this specific project
+- User can specify local dir, there's a default dir which is under current folder's "projects/" dir. If the corresponding dir already exists, warn this operation may overwrite the exsting files.
+- User can fill essential config, such as jira link and github link etc, if can login and choose from UI directly, would be better
+- User can triger jira ticket creation
+- User can triger github repo creation if it has not been created
+- Futher: user can set max parallelism, so multiple ticket can be processed at a time. Initially, by default max parallelism is set to 1
+- Even futher: user can set which coding assistant /model/ model version for coding and another for code review.
+- Future: User can let the schduler to continuesly perform the execution instead of waiting for user to approve. But for now, still need human approve.
+
+### Project Planing
+- User can write/post project brief in markdown format
+- User can triger project plan generating
+- Once project plan is genreated, show it and automatically verify the format and show format verified
+- The local repo should add AGENT.md to target repo
+
+### Proejct excution, multiple project management and operation. 
+- User can click the project list at the right side panel, and select specific project
+- The project page show up
+    - Config pandel
+        - most of them are read only once project is created
+        - Few fields can be modified, e.g. API token , coding agent, review agent etc.
+    - Summary window:
+      - Stats of the projects and tickets, code review.
+      - So the scheudler may need to collect the status
+    - JIRA window/panel
+        - user can choose tree view or list view of jira tickets, 
+        - So the scheudler may need to collect the status
+        - uUer can click and see the ticket status, and can set status and label(s) of the tickets.
+        - Use different color and symbol for different task types and jira status
+        - Tree view helps to clearly see the dependancies, and use different color and symbol for different task types and jira status
+        - User can click the jira link to jump to jira website to see detailed info
+        - If the ticket is in READY and codex-ready lablel, then execute button can be enabled.
+        - User then can triger the excution of the execution of the ticket
+    - PR window:
+        - PR under review
+        - PR passed test
+        - PR failed test
+        - PR recent history
+        - Each PR related Jira, no Jira, no PR
+    - Execution
+        - User can decide to do full automatic execution, i.e. execute the whole project, but for now, it is not allowed yet. But can have it ready
+        - User can decide to do jira/task level execution, accurding to dependency and max parrallelism
+        - If a jira is already in READY status and has codex_ready label, but blocked by dependency, then currently can error our. IN future can wait for the dependencies. Once all dependencies are done, then automatically kick off its exceution.
+
+    - Status window:
+        - Ticket being processed
+        - Ticket being coded
+        - Ticket in code review
+    - Log window
+        - when specific ticket is selected, show and tail logs of its processing, especially the coding agent logs
+    - Error window
+        - if a ticket hit issue the coding agent is not able to deal with, then show it in error window and waiting for further decision if needs to.
+        - If in error, may move it to block status in JIRA as well
+        - User may do retry. But before retry, the scheduler should help to check and if needed, set some of the status, e.g.:   
+           - if a task is actually done but record says it errored out, then clean the status and continue to mark as done instead of redo
+           - If a task is timeout, then automatically retry but add color and number to it. If it eventually errored out, try to figure out reason and move to error window waiting for further decison and operation
+
+- The management and execution of different projects should be isolated, i.e. one project should never mess up another project, and data/info of one project should not be leaked into another project
+
+### Data persistence
+- It would be good to keep the project setup and configuration, generated plan, jira ticket status in a DB
+- The data can be esaily migrated
+- It's easier to recover from error and crash if status and related record is kept in DB
+
+### Project removal (further)
+- Upon request
+- User can choose  push code to remote repo
+- User can choose remove code from local
+- Confirm project config/status will be removed from DB
+- Confirm project page will disapear
+- Once confirmed, schdule above oprations(for optional operation if specified) to be performed 3 days later. Mark the project as disabled and freezed. Unless user unfreze and re-open the project, the everything back to normal.
+
+### CLI (future)
+- It would be great to provide a CLI to perform the above operations.
+
