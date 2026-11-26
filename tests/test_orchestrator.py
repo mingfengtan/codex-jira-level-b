@@ -151,16 +151,49 @@ class TestYamlPlans(unittest.TestCase):
             from orchestrator import load_plan_schema, codex_output_schema
             output_schema_path = Path(cmd[cmd.index("--output-schema") + 1])
             self.assertEqual(output_schema_path.suffix, ".json")
-            self.assertEqual(json.loads(output_schema_path.read_text()),
-                             codex_output_schema(load_plan_schema()))
+            expected_schema = codex_output_schema(load_plan_schema())
+            expected_schema["properties"]["project"]["enum"] = [Cfg.project]
+            self.assertEqual(json.loads(output_schema_path.read_text()), expected_schema)
             destination = Path(cmd[cmd.index("--output-last-message") + 1])
             destination.write_text(json.dumps(example))
             return ""
-        with patch("orchestrator.run_command", side_effect=fake_run) as call:
-            plan_command(Cfg(), brief, output)
+        with patch("orchestrator.run_plan_codex", side_effect=fake_run) as call:
+            plan_command(Cfg(), brief, output, log_path=self.dir / "run.jsonl")
+        self.assertTrue((self.dir / "run.last.json").exists())
         self.assertEqual(read_plan(output), example)
         self.assertIn("--output-schema", call.call_args.args[0])
         self.assertIn("codex", call.call_args.args[0][0])
+
+    def test_plan_normalizes_only_generated_project_key(self):
+        import json
+        import contextlib
+        import io
+        from unittest.mock import patch
+        from orchestrator import plan_command, read_plan
+        example = read_plan(self.example)
+        example["project"] = "WRONG"
+        class Cfg:
+            project = "SSG"
+            repo = self.dir
+            codex_timeout = 3
+        brief = self.dir / "brief.md"
+        brief.write_text("Create the game")
+        output = self.dir / "plan.yaml"
+        def fake_run(cmd, **kwargs):
+            schema = json.loads(Path(cmd[cmd.index("--output-schema") + 1]).read_text())
+            self.assertEqual(schema["properties"]["project"]["enum"], ["SSG"])
+            Path(cmd[cmd.index("--output-last-message") + 1]).write_text(json.dumps(example))
+        capture = io.StringIO()
+        with patch("orchestrator.run_plan_codex", side_effect=fake_run):
+            with contextlib.redirect_stdout(capture):
+                plan_command(Cfg(), brief, output, log_path=self.dir / "run.jsonl")
+        generated = read_plan(output)
+        self.assertEqual(generated["project"], "SSG")
+        self.assertEqual(generated["epics"], example["epics"])
+        self.assertIn("using configured Jira project 'SSG'", capture.getvalue())
+        # Direct application of a mismatched user-supplied plan is still rejected.
+        with self.assertRaisesRegex(ValueError, "Plan project must be SSG"):
+            validate_plan(example, "SSG")
 
     def test_apply_plan_yaml_creates_epics_tasks_and_links_once(self):
         from unittest.mock import patch

@@ -1,7 +1,10 @@
-config
 .env
 *.applied.json
 __pycache__/
 *.pyc
 
 plan.applied.json
+
+# Codex event logs can contain private project details
+logs/
+config

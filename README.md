@@ -34,6 +34,38 @@ python3 orchestrator.py validate-plan plan.yaml
 python3 orchestrator.py apply-plan plan.yaml --yes
 ```
 
+### Live planning progress, logs, and Jira project key
+
+The `plan` command streams `codex exec --json` events to `logs/plan-generation.jsonl`
+while displaying session starts, turn status, tool activity and a heartbeat every
+15 seconds (configurable with `PLAN_HEARTBEAT_SECONDS`). The heartbeat means
+**the child process is still running**, not necessarily that the model is
+making forward progress. The per-run JSONL log may include project context and
+should remain private and uncommitted.
+
+```bash
+# Scheduler directory, not app directory:
+python3 orchestrator.py plan project_brief.md --out plan.yaml \
+  --log logs/plan-generation.jsonl
+# In another terminal:
+tail -f logs/plan-generation.jsonl
+```
+
+After Codex exits successfully, its raw response is retained as
+`logs/plan-generation.last.json` **before** semantic validation, so a failed
+validation does not discard a lengthy planning result. Do not commit or share
+this file without checking its content. The final `plan.yaml` is written only
+after validation passes. `Ctrl+C` stops the planning subprocess; unlike ticket
+execution, planning session resume is not yet implemented.
+
+The project key is **owned by `.env`** (`JIRA_PROJECT_KEY=SSG` in this setup).
+During generation the scheduler constrains the temporary Codex output schema
+to that exact value. If Codex nevertheless returns a different value, only the
+generated `project` field is normalized and a warning is printed. User-supplied
+YAML remains strictly checked: `validate-plan` and `apply-plan` refuse any
+plan whose `project` does not match `.env`. No Jira tickets are created by
+`plan`.
+
 ### B. Automatically create Jira tickets from the brief (requested mode)
 
 ```bash

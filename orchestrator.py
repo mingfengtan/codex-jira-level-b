@@ -243,6 +243,123 @@ def run_command(args: list[str], cwd: Path | None = None, timeout: int = 120,
     return completed.stdout.strip()
 
 
+def run_plan_codex(args: list[str], cwd: Path, timeout: int, log_path: Path,
+                   heartbeat_seconds: float = 15.0) -> None:
+    """Stream Codex JSONL events into a durable log and show concise progress.
+
+    This is one asynchronous subprocess, not concurrent planning. The JSONL log
+    intentionally contains raw Codex events; it may contain project details.
+    Do not commit or share it unreviewed.
+    """
+    log_path = log_path.expanduser().resolve()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Codex event log: {log_path}", flush=True)
+    print(f"Follow from another terminal: tail -f {log_path}", flush=True)
+    started = time.monotonic()
+    last_heartbeat = started
+    last_activity = started
+    stdout_tail = bytearray()
+    line_buffer = bytearray()
+    event_failures: list[str] = []
+    session_id = None
+    process = subprocess.Popen(
+        args[:-1] + ["--json", args[-1]] if "--json" not in args else args,
+        cwd=cwd, env=safe_env(), stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    def write_event(log, event: dict) -> None:
+        log.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
+        log.flush()
+    def handle_line(raw: bytes, log) -> None:
+        nonlocal session_id
+        if not raw.strip():
+            return
+        try:
+            event = json.loads(raw)
+            if not isinstance(event, dict):
+                raise ValueError("not an event object")
+        except (ValueError, UnicodeDecodeError):
+            event = {"type": "orchestrator.non_json_output",
+                     "text": raw.decode("utf-8", errors="replace")}
+        write_event(log, event)
+        kind = event.get("type", "unknown")
+        elapsed = int(time.monotonic() - started)
+        if kind == "thread.started":
+            session_id = event.get("thread_id")
+            print(f"[{elapsed}s] Codex session started: {session_id}", flush=True)
+        elif kind == "turn.started":
+            print(f"[{elapsed}s] Codex turn started", flush=True)
+        elif kind in {"item.started", "item.completed", "item.updated"}:
+            item = event.get("item") or {}
+            if isinstance(item, dict) and item.get("type") in {"command_execution", "web_search", "mcp_tool_call"}:
+                if kind != "item.updated":
+                    print(f"[{elapsed}s] {kind}: {item['type']}", flush=True)
+        elif kind == "turn.completed":
+            print(f"[{elapsed}s] Codex turn completed", flush=True)
+        elif kind in {"error", "turn.failed"}:
+            detail = event.get("error")
+            # Don't print full model text / secret-containing prompt to terminal.
+            excerpt = str(detail)[:350] if detail is not None else kind
+            event_failures.append(excerpt)
+            print(f"[{elapsed}s] Codex reported {kind}: {excerpt}", flush=True)
+        elif kind == "orchestrator.non_json_output":
+            print(f"[{elapsed}s] Codex output: {event['text'][:240]}", flush=True)
+
+    try:
+        with log_path.open("ab") as log, selectors.DefaultSelector() as selector:
+            write_event(log, {"type": "orchestrator.start", "at": instant(),
+                              "pid": process.pid, "timeout_seconds": timeout})
+            assert process.stdout is not None
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                now = time.monotonic()
+                if now - started >= timeout:
+                    write_event(log, {"type": "orchestrator.timeout", "after_seconds": timeout,
+                                      "session_id": session_id})
+                    raise TimeoutError(f"Codex planning timed out after {timeout}s. "
+                                       f"Events saved in {log_path}; session={session_id}")
+                if now - last_heartbeat >= heartbeat_seconds:
+                    print(f"[{int(now-started)}s] Still waiting for Codex; "
+                          f"last event {int(now-last_activity)}s ago. Log: {log_path}", flush=True)
+                    last_heartbeat = now
+                events = selector.select(timeout=0.3)
+                for _key, _mask in events:
+                    chunk = os.read(process.stdout.fileno(), 65536)
+                    if not chunk:
+                        selector.unregister(process.stdout)
+                        continue
+                    last_activity = time.monotonic()
+                    stdout_tail.extend(chunk)
+                    if len(stdout_tail) > 20000:
+                        del stdout_tail[:-20000]
+                    line_buffer.extend(chunk)
+                    while b"\n" in line_buffer:
+                        raw, _, remainder = line_buffer.partition(b"\n")
+                        line_buffer = bytearray(remainder)
+                        handle_line(raw, log)
+                if process.poll() is not None and not selector.get_map():
+                    if line_buffer:
+                        handle_line(bytes(line_buffer), log)
+                        line_buffer.clear()
+                    break
+            code = process.wait()
+            write_event(log, {"type": "orchestrator.exit", "returncode": code,
+                              "duration_seconds": int(time.monotonic()-started),
+                              "session_id": session_id})
+        if code != 0 or event_failures:
+            summary = event_failures[-1] if event_failures else stdout_tail.decode(
+                "utf-8", errors="replace")[-750:]
+            raise RuntimeError(f"Codex plan generation failed (exit={code}). "
+                               f"See {log_path}. Last error: {summary}")
+    except BaseException:
+        terminate_group(process)
+        raise
+    finally:
+        if process.stdout:
+            process.stdout.close()
+
+
 def codex_args(repo: Path, sandbox: str = "workspace-write") -> list[str]:
     # The Codex exec subcommand does not accept --ask-for-approval after exec.
     # Keep the CLI executable explicit so a Python venv cannot shadow it with
@@ -391,7 +508,8 @@ def validate_plan(plan: dict, project: str) -> None:
     for node in edges:
         walk(node)
 
-def plan_command(cfg: Config, brief_path: Path, output_path: Path) -> None:
+def plan_command(cfg: Config, brief_path: Path, output_path: Path,
+                 log_path: Path | None = None) -> None:
     brief = brief_path.read_text(encoding="utf-8")
     if not brief.strip():
         raise ValueError("Brief cannot be empty")
@@ -420,12 +538,35 @@ BRIEF:\n{brief[:30000]}"""
     with tempfile.TemporaryDirectory(prefix="codex-jira-plan-") as tmp_dir:
         model_output = Path(tmp_dir) / "codex-plan.json"
         json_schema = Path(tmp_dir) / "plan.schema.json"
-        json_schema.write_text(json.dumps(codex_output_schema(load_plan_schema()),
-                                          ensure_ascii=False), encoding="utf-8")
-        run_command(codex_args(cfg.repo, "read-only") + ["--output-schema", str(json_schema),
-                    "--output-last-message", str(model_output), prompt], cwd=cfg.repo,
-                    timeout=cfg.codex_timeout, env=safe_env())
-        content = json.loads(model_output.read_text(encoding="utf-8"))
+        # Pin the project identifier in the temporary Codex schema. The model
+        # should not invent the Jira key, which is owned by the controller.
+        strict_schema = codex_output_schema(load_plan_schema())
+        strict_schema["properties"]["project"]["enum"] = [cfg.project]
+        json_schema.write_text(json.dumps(strict_schema, ensure_ascii=False), encoding="utf-8")
+        run_plan_codex(codex_args(cfg.repo, "read-only") + ["--output-schema", str(json_schema),
+                       "--output-last-message", str(model_output), prompt], cwd=cfg.repo,
+                       timeout=cfg.codex_timeout,
+                       log_path=log_path or ROOT / "logs" / "plan-generation.jsonl",
+                       heartbeat_seconds=max(1.0, float(os.getenv("PLAN_HEARTBEAT_SECONDS", "15"))))
+        # Preserve the exact model result outside the temporary directory, so
+        # schema/semantic validation errors do not throw away a costly run.
+        actual_log = (log_path or ROOT / "logs" / "plan-generation.jsonl").expanduser().resolve()
+        last_output = actual_log.with_suffix(".last.json")
+        last_output.parent.mkdir(parents=True, exist_ok=True)
+        last_output.write_bytes(model_output.read_bytes())
+        last_output.chmod(0o600)
+        print(f"Raw generated plan saved: {last_output}", flush=True)
+        content = json.loads(last_output.read_text(encoding="utf-8"))
+    # The Jira project is configuration, not a field the model can choose. Even
+    # if a provider ignores the single-value enum, normalize ONLY this field;
+    # all other fields must still pass schema/dependency validation.
+    if not isinstance(content, dict):
+        raise ValueError("Codex plan output must be a JSON object")
+    proposed_project = content.get("project")
+    if proposed_project != cfg.project:
+        print(f"Warning: Codex returned project={proposed_project!r}; "
+              f"using configured Jira project {cfg.project!r} instead.", flush=True)
+        content["project"] = cfg.project
     validate_plan(content, cfg.project)
     write_plan(output_path, content)
     print(f"Plan generated: {output_path}\nReview and edit this file before apply-plan.")
@@ -490,7 +631,7 @@ def apply_plan(cfg: Config, plan_path: Path) -> None:
 
 def ensure_git_repo(cfg: Config) -> None:
     actual = Path(run_command(["git", "-C", str(cfg.repo), "rev-parse", "--show-toplevel"])).resolve()
-    if actual != cfg.repo.resolve():
+    if actual != cfg.repo:
         raise ValueError(f"REPO_PATH must be Git repository root: {actual}")
 
 
@@ -1151,6 +1292,8 @@ def main() -> None:
     plan_parser = sub.add_parser("plan", help="Generate P0/P1 plan YAML; does not write Jira")
     plan_parser.add_argument("brief", type=Path)
     plan_parser.add_argument("--out", type=Path, default=ROOT / "plan.yaml")
+    plan_parser.add_argument("--log", type=Path, default=ROOT / "logs" / "plan-generation.jsonl",
+                             help="Persistent Codex JSON event log")
     apply_parser = sub.add_parser("apply-plan", help="Idempotently create Jira tickets/links")
     apply_parser.add_argument("plan", type=Path)
     apply_parser.add_argument("--yes", action="store_true")
@@ -1183,7 +1326,7 @@ def main() -> None:
     cfg = Config.from_env()
     if args.command == "plan":
         ensure_git_repo(cfg)
-        plan_command(cfg, args.brief, args.out)
+        plan_command(cfg, args.brief, args.out, log_path=args.log)
     elif args.command == "apply-plan":
         if not args.yes:
             parser.error("apply-plan writes Jira tickets; add --yes after review")
