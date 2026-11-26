@@ -1,0 +1,221 @@
+# Example ONLY: change project key to your JIRA_PROJECT_KEY before using.
+project: AIDEV
+epics:
+- id: foundation
+  summary: P0 - Flutter game foundation
+  phase: P0
+  description: Establish an offline Flutter + Flame app, test infrastructure and versioned level data.
+  tasks:
+  - id: flutter-bootstrap
+    summary: Bootstrap Flutter/Flame for Android, iOS and macOS
+    description: Initialize Flutter project in current Git repository; enable Android, iOS, macOS; add Flame
+      and an initial runnable main app. Do not add Bazel or a backend.
+    type: Task
+    priority: High
+    acceptance_criteria:
+    - flutter pub get succeeds
+    - flutter analyze succeeds
+    - flutter test succeeds with an initial test
+    - README documents platform prerequisites
+    depends_on: []
+  - id: quality-gates
+    summary: Set up code quality and test commands
+    description: Document and automate formatting, static analysis, unit/widget tests, CI. Provide macOS/iOS
+      validation instructions without claiming those builds ran on Linux.
+    type: Task
+    priority: High
+    acceptance_criteria:
+    - CI/check script runs without secrets
+    - CI invokes flutter analyze and flutter test
+    - README explains how to run checks locally
+    depends_on:
+    - flutter-bootstrap
+  - id: physics-core
+    summary: Implement pure Dart deterministic fixed-step simulation
+    description: Create pure Dart ball/position/velocity/timestep model, movement under baseline gravity and
+      stable bounded stepping. Exclude rendering from domain.
+    type: Task
+    priority: High
+    acceptance_criteria:
+    - A fixed seed and initial state reproduce path within tolerance
+    - Stable simulation at fixed timestep in automated tests
+    - Domain can run with flutter test without graphics
+    depends_on:
+    - flutter-bootstrap
+  - id: level-formats
+    summary: Define versioned YAML level format and semantic validation
+    description: Implement level format for paths/nodes, launcher boundaries, targets, walls, reflectors and
+      coins, plus fixtures and a command to validate levels.
+    type: Task
+    priority: High
+    acceptance_criteria:
+    - Valid level fixture parses and passes validation
+    - Malformed/missing positions, unsupported version and broken target IDs fail
+    - Example level included under assets
+    depends_on:
+    - flutter-bootstrap
+- id: game-mechanics
+  summary: P1 - Core physics puzzle loop
+  phase: P1
+  description: Complete first playable single-player launch, collision, win/fail and scoring systems.
+  tasks:
+  - id: aim-and-launch
+    summary: Aim from bottom line and launch one ball
+    description: Implement launch position clamped to bottom line, direction selection, launch input and attempt
+      state machine.
+    type: Story
+    priority: High
+    acceptance_criteria:
+    - Launcher position cannot leave allowed segment
+    - Launch angle is visually adjustable
+    - A level begins one flight per attempt
+    depends_on:
+    - physics-core
+    - level-formats
+  - id: collision-targets
+    summary: Handle bounce blocks, reflectors and targets
+    description: Add collision mechanics for simple blocks and fixed-angle walls/surfaces; define target hit
+      and multi-target completion.
+    type: Story
+    priority: High
+    acceptance_criteria:
+    - Bounce matches documented normal-based reflection
+    - All required targets needed to win
+    - Timeout/out-of-bounds failure handled
+    - Deterministic collision unit tests pass
+    depends_on:
+    - aim-and-launch
+  - id: coins-and-scoring
+    summary: Implement coins, time bonus, stars and failure penalties
+    description: Score +10 for each coin pickup; configure completion/time/stars by level; clamp failure penalties;
+      prevent repeat-win coin farming.
+    type: Story
+    priority: High
+    acceptance_criteria:
+    - Each coin pickup increases attempt score by 10
+    - 1/2/3 star thresholds are data-driven
+    - Fail penalties never make score negative
+    - First-time coin reward cannot be farmed on retries
+    depends_on:
+    - collision-targets
+  - id: local-persistence
+    summary: Persist progress, settings and earned coin balance
+    description: Implement local repository interface for settings and per-level best score/stars, unlock graph,
+      and earned currency.
+    type: Task
+    priority: High
+    acceptance_criteria:
+    - Progress remains across app relaunch in integration fixture
+    - Best score/stars are not overwritten by worse replay
+    - Corrupt/old save has recoverable handling
+    depends_on:
+    - coins-and-scoring
+- id: player-experience
+  summary: P1 - User experience and authored levels
+  phase: P1
+  description: Build the navigable, accessible player experience and 10 level pack.
+  tasks:
+  - id: game-screen
+    summary: Build the gameplay screen and result overlays
+    description: Use Flame in Flutter, render ball/target/obstacles, input indicators, launch, retry, win/fail
+      overlay and exit to map.
+    type: Story
+    priority: High
+    acceptance_criteria:
+    - Touch and mouse aim/launch works
+    - Screen shows distinct win/fail feedback
+    - Retry resets state reproducibly
+    depends_on:
+    - collision-targets
+  - id: level-map
+    summary: Build branching level map with completed green nodes and stars
+    description: Create a graph-like main screen for levels, locked/unlocked state, stars, coin display and
+      navigation.
+    type: Story
+    priority: High
+    acceptance_criteria:
+    - Completed nodes are green and show best stars
+    - Locked levels cannot launch
+    - Unlocking depends on prior level completion
+    depends_on:
+    - local-persistence
+  - id: settings
+    summary: Add music/sfx toggles and basic theme settings
+    description: Create settings screen and local persistence of sound and basic theme selection. No premium
+      checkout.
+    type: Story
+    priority: Medium
+    acceptance_criteria:
+    - Music and sound effects can be toggled independently
+    - Selections persist on relaunch
+    - Controls are labelled for accessibility
+    depends_on:
+    - local-persistence
+  - id: ten-levels
+    summary: Create ten progressively harder handcrafted offline levels
+    description: Author ten levels with a documented progression and validate/playtest representative successful
+      trajectories.
+    type: Story
+    priority: High
+    acceptance_criteria:
+    - Exactly ten playable sample levels load from local assets
+    - Each level has documented win path verified by simulation replay
+    - No custom backend or network needed
+    depends_on:
+    - game-screen
+    - level-formats
+    - coins-and-scoring
+- id: verification-and-handoff
+  summary: P1 - Regression tests and release readiness
+  phase: P1
+  description: Automated verification and honest release readiness documentation; no publishing.
+  tasks:
+  - id: physics-regression
+    summary: Add replay-based deterministic physics regression suite
+    description: Add fixtures covering collision, coin pickup, target order, timeout and a replay of each authored
+      level.
+    type: Task
+    priority: High
+    acceptance_criteria:
+    - Deterministic fixture suite covers all ten levels
+    - Physics changes that break replay fail tests
+    - Test command and tolerances documented
+    depends_on:
+    - ten-levels
+  - id: player-integration
+    summary: Add end-to-end offline smoke and persistence tests
+    description: Use Flutter integration_test for launch→win→unlock→relaunch and failed attempt→retry.
+    type: Task
+    priority: High
+    acceptance_criteria:
+    - At least one gameplay journey verified by integration_test
+    - Failed attempt and retry covered
+    - CI doc identifies device/simulator requirements
+    depends_on:
+    - game-screen
+    - level-map
+    - local-persistence
+  - id: performance-baseline
+    summary: Document and implement performance profiling baseline
+    description: Instrument frame time and simulation speed for reference devices, write reproducible measurement
+      procedure.
+    type: Task
+    priority: Medium
+    acceptance_criteria:
+    - Profiling command/procedure documented
+    - Fixed-size simulation benchmark in repository
+    - No unmeasured frame-rate guarantee
+    depends_on:
+    - ten-levels
+  - id: store-readiness-docs
+    summary: Create store/release placeholder documentation
+    description: Create docs/release/README.md for Play Store, iOS App Store/TestFlight and macOS signing/notarization,
+      privacy, rating and metadata. Do not deploy.
+    type: Task
+    priority: Low
+    acceptance_criteria:
+    - Android/iOS/macOS release checklists exist
+    - No real signing keys or credentials committed
+    - Purchases, subscriptions, ads and multiplayer marked future work
+    depends_on:
+    - flutter-bootstrap

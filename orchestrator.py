@@ -148,7 +148,7 @@ class Jira:
         return response.get("issues", [])
 
     def issue(self, key: str) -> dict:
-        fields = "summary,description,status,labels,issuetype,issuelinks,parent"
+        fields = "summary,description,status,labels,issuetype,issuelinks,parent,subtasks"
         return self.call("GET", f"/issue/{urllib.parse.quote(key)}?fields={fields}")
 
     def dependencies_satisfied(self, issue: dict) -> bool:
@@ -185,6 +185,13 @@ class Jira:
         }
         if parent:
             fields["parent"] = {"key": parent}
+        if issue_type == "Subtask":
+            # Jira sites use either 'Sub-task' or 'Subtask'; use its actual ID.
+            metadata = self.call("GET", f"/project/{urllib.parse.quote(self.cfg.project)}")
+            candidates = [t for t in metadata.get("issueTypes", []) if t.get("subtask") is True]
+            if not candidates:
+                raise RuntimeError("Subtask work type is not enabled in the Jira space")
+            fields["issuetype"] = {"id": candidates[0]["id"]}
         return self.call("POST", "/issue", {"fields": fields})["key"]
 
     def blocks(self, blocker: str, blocked: str) -> None:
@@ -277,42 +284,27 @@ def validate_plan(plan: dict, project: str) -> None:
         raise ValueError("Plan must contain at least one epic")
     ids: set[str] = set()
     edges: dict[str, list[str]] = {}
+    parents: dict[str, str] = {}
+    def check_id(identifier: str) -> None:
+        if identifier in ids:
+            raise ValueError(f"Duplicate id: {identifier}")
+        ids.add(identifier)
     for epic in epics:
-        if not isinstance(epic, dict) or any(
-            not isinstance(epic.get(field), str) or not epic[field].strip()
-            for field in ("id", "summary", "description")
-        ):
-            raise ValueError("Each epic needs nonempty id, summary, and description")
-        if epic["id"] in ids:
-            raise ValueError(f"Duplicate id: {epic['id']}")
-        ids.add(epic["id"])
-        if not isinstance(epic.get("tasks"), list):
-            raise ValueError(f"Epic {epic['id']} needs tasks list")
+        check_id(epic["id"])
         for task in epic["tasks"]:
-            if not isinstance(task, dict) or any(
-                not isinstance(task.get(field), str) or not task[field].strip()
-                for field in ("id", "summary", "description")
-            ):
-                raise ValueError("Each task needs nonempty id, summary, and description")
-            task_id = task["id"]
-            criteria = task.get("acceptance_criteria")
-            deps = task.get("depends_on")
-            if not isinstance(criteria, list) or not criteria or not all(
-                isinstance(value, str) and value.strip() for value in criteria
-            ):
-                raise ValueError(f"Task {task_id} needs nonempty acceptance_criteria strings")
-            if not isinstance(deps, list) or not all(isinstance(dep, str) for dep in deps):
-                raise ValueError(f"Task {task_id} needs depends_on list of task IDs")
-            if task_id in ids:
-                raise ValueError(f"Duplicate id: {task_id}")
-            ids.add(task_id)
-            edges[task_id] = deps
+            check_id(task["id"])
+            edges[task["id"]] = task["depends_on"]
+            for child in task.get("subtasks", []):
+                check_id(child["id"])
+                edges[child["id"]] = child["depends_on"]
+                parents[child["id"]] = task["id"]
     for task, dependencies in edges.items():
         if any(dep not in edges or dep == task for dep in dependencies):
             raise ValueError(f"Invalid dependency for {task}: {dependencies}")
+        if parents.get(task) in dependencies:
+            raise ValueError(f"Subtask {task} cannot depend on parent")
     visiting: set[str] = set()
     visited: set[str] = set()
-
     def walk(node: str) -> None:
         if node in visiting:
             raise ValueError(f"Dependency cycle involving {node}")
@@ -323,10 +315,8 @@ def validate_plan(plan: dict, project: str) -> None:
             walk(dep)
         visiting.remove(node)
         visited.add(node)
-
     for node in edges:
         walk(node)
-
 
 def plan_command(cfg: Config, brief_path: Path, output_path: Path) -> None:
     brief = brief_path.read_text(encoding="utf-8")
@@ -338,9 +328,16 @@ def plan_command(cfg: Config, brief_path: Path, output_path: Path) -> None:
     prompt = f"""You are the tech lead planning a development project.
 Read the repository and the brief below. Return ONLY JSON matching the provided schema.
 Project key: {cfg.project}
-Make 2-5 epics and reasonably scoped tasks. Each task has specific, verifiable acceptance criteria.
-Use stable ids like 'auth' or 'auth-login-api'; depends_on refers to task ids.
-Represent tasks in likely implementation order and keep dependencies acyclic.
+Plan ONLY P0 Foundation and P1 Playable MVP, not later roadmap phases.
+Create 3-5 epics and 12-20 total small tasks with measurable acceptance criteria.
+Every Epic MUST set phase to P0 or P1. No P2+ epics in the initial plan.
+The first task must scaffold Flutter in the initially minimal repository.
+Use Story for player-facing functionality; Task for engineering infrastructure.
+Do not use subtasks unless they create a meaningful non-overlapping split. A parent
+with subtasks is for grouping only; the parent must not duplicate child work.
+Use stable IDs and depends_on references to plan task/subtask IDs, with no cycles.
+Explicitly defer ads, purchases, subscription, online multiplayer, release and
+remote download. Order tasks by likely implementation sequence.
 Do not modify files, call Jira, or implement any code.
 
 BRIEF:\n{brief[:30000]}"""
@@ -367,38 +364,55 @@ def apply_plan(cfg: Config, plan_path: Path) -> None:
     state = json.loads(state_file.read_text()) if state_file.exists() else {"issues": {}, "links": []}
     jira = Jira(cfg)
 
-    def persist():
+    def persist() -> None:
         tmp = state_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, indent=2) + "\n")
         tmp.replace(state_file)
 
+    def description(item: dict, epic: dict) -> str:
+        criteria = "\n".join(f"- {value}" for value in item["acceptance_criteria"])
+        # Jira's priority names depend on space configuration: don't blindly set.
+        return (f"{item['description']}\n\n"
+                f"Phase: {epic.get('phase', 'unspecified')}\n"
+                f"Suggested priority: {item.get('priority', 'unspecified')}\n\n"
+                f"Acceptance criteria:\n{criteria}")
+
     for epic in plan["epics"]:
         if epic["id"] not in state["issues"]:
-            issue_key = jira.create_issue(epic["summary"], epic["description"], "Epic")
-            state["issues"][epic["id"]] = issue_key
+            desc = f"Phase: {epic.get('phase', 'unspecified')}\n\n{epic['description']}"
+            key = jira.create_issue(epic["summary"], desc, "Epic")
+            state["issues"][epic["id"]] = key
             persist()
-            print(f"Epic {epic['id']} -> {issue_key}")
+            print(f"Epic {epic['id']} -> {key}")
         epic_key = state["issues"][epic["id"]]
         for task in epic["tasks"]:
             if task["id"] not in state["issues"]:
-                criteria = "\n".join(f"- {x}" for x in task["acceptance_criteria"])
-                description = f"{task['description']}\n\nAcceptance criteria:\n{criteria}"
-                issue_key = jira.create_issue(task["summary"], description, "Task", parent=epic_key)
-                state["issues"][task["id"]] = issue_key
+                issue_type = task.get("type", "Task")
+                key = jira.create_issue(task["summary"], description(task, epic),
+                                        issue_type, parent=epic_key)
+                state["issues"][task["id"]] = key
                 persist()
-                print(f"Task {task['id']} -> {issue_key}")
+                print(f"{issue_type} {task['id']} -> {key}")
+            parent_key = state["issues"][task["id"]]
+            for child in task.get("subtasks", []):
+                if child["id"] not in state["issues"]:
+                    key = jira.create_issue(child["summary"], description(child, epic),
+                                            "Subtask", parent=parent_key)
+                    state["issues"][child["id"]] = key
+                    persist()
+                    print(f"Subtask {child['id']} -> {key}")
     for epic in plan["epics"]:
         for task in epic["tasks"]:
-            for dep in task["depends_on"]:
-                pair = f"{dep}>{task['id']}"
-                if pair not in state["links"]:
-                    jira.blocks(state["issues"][dep], state["issues"][task["id"]])
-                    state["links"].append(pair)
-                    persist()
-                    print(f"Dependency {pair}")
+            for item in [task, *task.get("subtasks", [])]:
+                for dep in item["depends_on"]:
+                    pair = f"{dep}>{item['id']}"
+                    if pair not in state["links"]:
+                        jira.blocks(state["issues"][dep], state["issues"][item["id"]])
+                        state["links"].append(pair)
+                        persist()
+                        print(f"Dependency {pair}")
     print(f"Created/reconciled tickets; mapping: {state_file}")
-    print("None are auto-authorized. In Jira, transition a task to Ready and add label codex-ready.")
-
+    print("New tickets are unapproved: human must set Ready AND codex-ready.")
 
 def ensure_git_repo(cfg: Config) -> None:
     actual = Path(run_command(["git", "-C", str(cfg.repo), "rev-parse", "--show-toplevel"])).resolve()
@@ -498,44 +512,74 @@ def single_worker_lock(root: Path):
         yield
 
 
-def once(cfg: Config, dry_run: bool = False) -> None:
+def once(cfg: Config, dry_run: bool = False, already_locked: bool = False) -> None:
     ensure_git_repo(cfg)
     jira = Jira(cfg)
-    with single_worker_lock(cfg.worktree_root):
+    lock = contextlib.nullcontext() if already_locked else single_worker_lock(cfg.worktree_root)
+    with lock:
         candidates = jira.ready_issues()
         if not candidates:
             print("No Ready + codex-ready tasks")
             return
         for candidate in candidates:
             issue = jira.issue(candidate["key"])
-            if issue["fields"].get("issuetype", {}).get("name", "").casefold() not in {"task", "story", "bug", "sub-task", "subtask"}:
+            fields = issue["fields"]
+            if fields.get("issuetype", {}).get("name", "").casefold() not in {
+                "task", "story", "bug", "sub-task", "subtask"
+            }:
+                continue
+            if fields.get("subtasks"):
+                print(f"Skipping {issue['key']}: parent has subtasks")
                 continue
             if not jira.dependencies_satisfied(issue):
                 print(f"Skipping {issue['key']}: blocked by dependency")
                 continue
             if dry_run:
-                print(f"DRY RUN: would implement {issue['key']}: {issue['fields']['summary']}")
+                print(f"DRY RUN: would implement {issue['key']}: {fields['summary']}")
                 return
             execute_ticket(cfg, jira, issue)
             return
-        print("No unblocked executable tasks found among first 50 matching tickets")
+        print("No unblocked executable tickets in first 50 results")
 
+
+def bootstrap(cfg: Config, brief_path: Path, plan_path: Path) -> None:
+    """Generate plan if absent and sync it to Jira, without authorization."""
+    ensure_git_repo(cfg)
+    if not plan_path.exists():
+        plan_command(cfg, brief_path, plan_path)
+    else:
+        print(f"Reusing plan: {plan_path}")
+    plan = read_plan(plan_path)
+    validate_plan(plan, cfg.project)
+    invalid = [epic["id"] for epic in plan["epics"] if epic.get("phase") not in {"P0", "P1"}]
+    if invalid:
+        raise ValueError(f"Bootstrap refuses Epics outside P0/P1 or without a phase: {invalid}")
+    apply_plan(cfg, plan_path)
 
 def main() -> None:
     os.umask(0o077)
     load_env()
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    plan_parser = sub.add_parser("plan", help="Generate plan YAML for human review (no Jira writes)")
+    plan_parser = sub.add_parser("plan", help="Generate P0/P1 plan YAML; does not write Jira")
     plan_parser.add_argument("brief", type=Path)
     plan_parser.add_argument("--out", type=Path, default=ROOT / "plan.yaml")
-    apply_parser = sub.add_parser("apply-plan", help="Create Jira Epics, Tasks, and links")
+    apply_parser = sub.add_parser("apply-plan", help="Idempotently create Jira tickets/links")
     apply_parser.add_argument("plan", type=Path)
-    apply_parser.add_argument("--yes", action="store_true", help="Confirm creating Jira tickets")
-    validate_parser = sub.add_parser("validate-plan", help="Validate YAML/JSON without Jira changes")
+    apply_parser.add_argument("--yes", action="store_true")
+    validate_parser = sub.add_parser("validate-plan", help="Validate plan without Jira changes")
     validate_parser.add_argument("plan", type=Path)
-    once_parser = sub.add_parser("once", help="Run one Ready Jira task")
+    once_parser = sub.add_parser("once", help="Execute one approved Jira ticket")
     once_parser.add_argument("--dry-run", action="store_true")
+    boot_parser = sub.add_parser("bootstrap", help="Generate plan if missing and create unapproved tickets")
+    boot_parser.add_argument("--brief", type=Path, default=ROOT / "project_brief.md")
+    boot_parser.add_argument("--plan", type=Path, default=ROOT / "plan.yaml")
+    boot_parser.add_argument("--yes", action="store_true", help="Authorize Jira issue creation")
+    tick_parser = sub.add_parser("tick", help="Optional bootstrap, then implement one approved ticket")
+    tick_parser.add_argument("--bootstrap", action="store_true", help="Allow generating and applying tickets")
+    tick_parser.add_argument("--brief", type=Path, default=ROOT / "project_brief.md")
+    tick_parser.add_argument("--plan", type=Path, default=ROOT / "plan.yaml")
+    tick_parser.add_argument("--dry-run", action="store_true", help="Read-only; never bootstrap")
     args = parser.parse_args()
     if args.command == "validate-plan":
         project = os.getenv("JIRA_PROJECT_KEY", "").strip()
@@ -550,10 +594,21 @@ def main() -> None:
         plan_command(cfg, args.brief, args.out)
     elif args.command == "apply-plan":
         if not args.yes:
-            parser.error("apply-plan writes Jira tickets; review the YAML first and add --yes")
-        apply_plan(cfg, args.plan)
+            parser.error("apply-plan writes Jira tickets; add --yes after review")
+        with single_worker_lock(cfg.worktree_root):
+            apply_plan(cfg, args.plan)
     elif args.command == "once":
         once(cfg, args.dry_run)
+    elif args.command == "bootstrap":
+        if not args.yes:
+            parser.error("bootstrap writes Jira tickets; add --yes after choosing this mode")
+        with single_worker_lock(cfg.worktree_root):
+            bootstrap(cfg, args.brief, args.plan)
+    elif args.command == "tick":
+        with single_worker_lock(cfg.worktree_root):
+            if args.bootstrap and not args.dry_run:
+                bootstrap(cfg, args.brief, args.plan)
+            once(cfg, dry_run=args.dry_run, already_locked=True)
 
 
 if __name__ == "__main__":

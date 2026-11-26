@@ -56,7 +56,7 @@ class TestYamlPlans(unittest.TestCase):
         self.temp_dir = TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.dir = Path(self.temp_dir.name)
-        self.example = Path(__file__).resolve().parent.parent / "plan.example.yaml"
+        self.example = Path(__file__).resolve().parent / "fixtures" / "legacy.plan.yaml"
 
     def test_example_plan_valid_and_cross_epic_dependency(self):
         from orchestrator import read_plan

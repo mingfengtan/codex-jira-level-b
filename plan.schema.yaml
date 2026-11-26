@@ -1,5 +1,4 @@
-# YAML representation of a JSON Schema. Single source of truth for plan validation.
-# Use plan.schema.yaml for both local validation and Codex structured output.
+# YAML-form JSON Schema; sole source for Codex output constraints and validation.
 type: object
 additionalProperties: false
 required:
@@ -51,3 +50,59 @@ properties:
                 type: array
                 items:
                   type: string
+              type:
+                type: string
+                enum:
+                - Task
+                - Story
+                - Bug
+              priority:
+                type: string
+                enum:
+                - Highest
+                - High
+                - Medium
+                - Low
+                - Lowest
+              subtasks:
+                type: array
+                items:
+                  type: object
+                  additionalProperties: false
+                  required:
+                  - id
+                  - summary
+                  - description
+                  - acceptance_criteria
+                  - depends_on
+                  properties:
+                    id:
+                      type: string
+                    summary:
+                      type: string
+                    description:
+                      type: string
+                    acceptance_criteria:
+                      type: array
+                      items:
+                        type: string
+                    depends_on:
+                      type: array
+                      items:
+                        type: string
+                    priority:
+                      type: string
+                      enum:
+                      - Highest
+                      - High
+                      - Medium
+                      - Low
+                      - Lowest
+        phase:
+          type: string
+          enum:
+          - P0
+          - P1
+          - P2
+          - P3
+          - P4

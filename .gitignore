@@ -1,7 +1,6 @@
 .env
-plan.json
-plan.yaml
-plan.yml
 *.applied.json
 __pycache__/
 *.pyc
+
+plan.applied.json
