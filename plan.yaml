@@ -1,0 +1,351 @@
+project: SSG
+epics:
+- id: SSG-E01
+  summary: P0 Cross-platform Flutter foundation
+  description: Establish the initially minimal repository as an offline Flutter application for Android,
+    iOS, and macOS with Flame, a layered structure, automated quality gates, and architecture/release-readiness
+    documentation. Across this plan, ads, earned-coin and real-money purchases, subscriptions, online
+    multiplayer, remote content downloads, cloud services, deployment, and production store release are
+    explicitly deferred pending owner approval.
+  tasks:
+  - id: SSG-001
+    summary: Scaffold the Flutter application for Android, iOS, and macOS
+    description: Create the first Flutter application scaffold in the minimal repository, using the working
+      title only where a placeholder is required. Establish SDK constraints and repository safeguards
+      without configuring accounts, signing credentials, or publishing services.
+    acceptance_criteria:
+    - A Flutter application and platform projects for Android, iOS, and macOS are present and recognized
+      by `flutter doctor` and `flutter devices` where local toolchains are installed.
+    - The generated starter unit/widget test passes with `flutter test`, and the starter application can
+      build in debug mode for at least one locally supported target.
+    - The README records the required Flutter/Dart versions and setup commands, while final title, package
+      IDs, and signing values remain documented placeholders.
+    - Ignore rules cover `.env`, local `config/`, signing files, certificates, tokens, and other credential-bearing
+      artifacts; no secret is added to tracked files.
+    depends_on: []
+    type: Task
+    priority: Highest
+    subtasks: []
+  - id: SSG-002
+    summary: Integrate Flame and establish the layered project structure
+    description: Add Flame and organize the application into pure Dart domain/data layers plus Flame game
+      and Flutter UI layers. Keep domain code independent from widgets and rendering engines.
+    acceptance_criteria:
+    - Flame is declared through `flutter pub`, and a minimal `GameWidget` renders from the Flutter application
+      shell on a supported debug target.
+    - Directories exist for `lib/domain`, `lib/data`, `lib/game`, `lib/ui`, `test`, `integration_test`,
+      and `tool`, with documented dependency-direction rules.
+    - An automated architecture test or analyzer rule demonstrates that `lib/domain` does not import Flutter,
+      Flame, platform APIs, or persistence implementations.
+    - '`dart format --output=none --set-exit-if-changed .`, `flutter analyze`, and `flutter test` complete
+      successfully.'
+    depends_on:
+    - SSG-001
+    type: Task
+    priority: Highest
+    subtasks: []
+  - id: SSG-003
+    summary: Configure continuous Flutter quality checks
+    description: Provide repeatable local and CI checks for formatting, analysis, tests, and supported
+      platform builds without adding Bazel, paid services, deployment, or release automation.
+    acceptance_criteria:
+    - CI runs formatting verification, `flutter analyze`, and `flutter test` for every proposed change.
+    - The workflow runs an Android debug build where the configured runner supports it and does not claim
+      iOS or macOS success on non-macOS runners.
+    - Mac-only iOS/macOS checks are conditionally defined or documented with their required Xcode environment
+      and produce an explicit skipped result when unavailable.
+    - The documented local verification commands match CI commands and require no credentials or paid
+      services.
+    depends_on:
+    - SSG-002
+    type: Task
+    priority: High
+    subtasks: []
+  - id: SSG-004
+    summary: Document architecture, gameplay conventions, and release placeholders
+    description: Record P0/P1 boundaries, numerical conventions, ownership decisions, and future release
+      interfaces. Documentation must not enable publishing or introduce credentials.
+    acceptance_criteria:
+    - Architecture documentation identifies layer responsibilities, allowed dependencies, fixed-step timing,
+      coordinate units, collision tolerance policy, and the offline-only P0/P1 boundary.
+    - Open decisions for final title, visual/audio licensing, audience, scoring values, star thresholds,
+      and broader economy are listed as owner approval gates rather than silently resolved.
+    - '`docs/release/README.md` contains future checklists for Android Play Console, App Store Connect/TestFlight,
+      and macOS signing/notarization, including placeholders requested in the brief.'
+    - The release document explicitly states that store accounts, signing material, uploads, live purchases,
+      ads, subscriptions, remote downloads, and production release are not implemented or authorized.
+    depends_on:
+    - SSG-002
+    - SSG-003
+    type: Task
+    priority: Medium
+    subtasks: []
+  phase: P0
+- id: SSG-E02
+  summary: P0 Deterministic gameplay and content foundation
+  description: Build a pure Dart, fixed-step simulation and validated local level format, then connect
+    them to basic Flame rendering and accessible touch/mouse launch controls. P2 gravity wells, anti-gravity,
+    black holes, adjustable reflectors, equipment, and controllable balls remain unsupported.
+  tasks:
+  - id: SSG-005
+    summary: Implement the deterministic fixed-step simulation core
+    description: Create immutable or explicitly owned simulation state for the ball, bounded forces, time,
+      and deterministic stepping. Provide extension points without implementing P2 field entities.
+    acceptance_criteria:
+    - The domain simulation advances through one documented fixed time step independent of render-frame
+      cadence and caps accumulated catch-up work at a documented bound.
+    - Ball position, velocity, radius, mass, and bounded acceleration/force inputs use documented units
+      and finite-value validation.
+    - Seeded tests produce equivalent final state within the documented tolerance when the same elapsed
+      time is supplied in different render-frame chunk sizes.
+    - Tests cover zero force, maximum allowed force, invalid/non-finite inputs, and repeatability across
+      at least 1,000 fixed steps.
+    depends_on:
+    - SSG-002
+    type: Task
+    priority: Highest
+    subtasks: []
+  - id: SSG-006
+    summary: Implement collision, target, and attempt lifecycle primitives
+    description: Add deterministic geometry and rules for world bounds, static collision surfaces, required
+      target contact, and attempt termination while remaining independent of Flame.
+    acceptance_criteria:
+    - Pure Dart collision tests cover ball contacts with axis-aligned and angled static surfaces, including
+      documented separation and velocity tolerances.
+    - Target state records each required target at most once per attempt and reports completion only after
+      every required target has been contacted.
+    - Attempt state supports the P1 default of one launch and fails deterministically for out-of-bounds,
+      destroyed, or configured time-limit conditions.
+    - Regression tests cover grazing contacts, simultaneous contacts, repeated target overlap, timeout
+      boundaries, and zero-speed states without NaN or unbounded velocity.
+    depends_on:
+    - SSG-005
+    type: Task
+    priority: Highest
+    subtasks: []
+  - id: SSG-007
+    summary: Define and validate versioned local level YAML
+    description: Create a human-editable, versioned YAML format and a command-line validator for locally
+      bundled P0/P1 level data.
+    acceptance_criteria:
+    - The documented YAML schema includes format version, graph identifiers, launch bounds, initial ball
+      properties, required targets, supported obstacles, coins, attempt limits, objective rules, and configurable
+      scoring/star fields.
+    - The validator rejects unknown format versions, duplicate IDs, invalid graph references, overlapping
+      or out-of-bounds launch ranges, invalid thresholds, and unsupported P2 entity types with actionable
+      messages.
+    - Validator unit tests include at least one valid fixture and one fixture for each rejection category.
+    - A tool command validates all bundled level assets and exits nonzero if any file fails schema or
+      semantic checks.
+    depends_on:
+    - SSG-002
+    - SSG-005
+    type: Task
+    priority: High
+    subtasks: []
+  - id: SSG-008
+    summary: Render a level and provide drag-to-aim launch controls
+    description: Connect the domain simulation to Flame rendering so a player can position the ball along
+      the bottom launch line, aim with touch or mouse, and launch once using either gesture flow or an
+      accessible button.
+    acceptance_criteria:
+    - A validated local level renders its bounds, launch line, ball, targets, and static geometry through
+      Flame without domain code importing Flame.
+    - Touch and mouse dragging clamp the starting position to the configured bottom launch interval and
+      display a visible direction indicator.
+    - The Launch button has an accessibility label, is keyboard-focusable on macOS, and starts exactly
+      one simulation launch with the selected position and direction.
+    - Widget and domain tests cover minimum/maximum launch positions, invalid aim magnitude, duplicate
+      launch input, touch input, and mouse input on a compact portrait viewport.
+    depends_on:
+    - SSG-006
+    - SSG-007
+    type: Story
+    priority: Highest
+    subtasks: []
+  - id: SSG-009
+    summary: Add deterministic replay fixtures and performance instrumentation
+    description: Create regression fixtures for simulation inputs/outcomes plus instrumentation that records
+      simulation throughput and Flutter frame timing without making unsupported performance claims.
+    acceptance_criteria:
+    - At least three fixed fixtures record level version, launch input, expected target contacts, termination
+      result, elapsed simulation time, and numeric tolerances.
+    - A test replays every fixture and fails when the recorded outcome changes outside documented tolerances.
+    - A profile-mode diagnostic reports simulation-step throughput and Flutter frame timing with device,
+      OS, build mode, and sample duration metadata.
+    - Documentation states 60 FPS as the target and labels results as a baseline; no numeric device claim
+      is made unless a real-device measurement is recorded.
+    depends_on:
+    - SSG-006
+    - SSG-007
+    - SSG-008
+    type: Task
+    priority: High
+    subtasks: []
+  phase: P0
+- id: SSG-E03
+  summary: P1 Offline playable vertical slice
+  description: Deliver the complete offline aim, launch, target, obstacle, coin, score, star, win/fail,
+    and retry experience across ten authored levels. The P1 defaults are one launch per attempt and all
+    required targets contacted during that attempt; scoring parameters remain level-configured and subject
+    to owner review.
+  tasks:
+  - id: SSG-010
+    summary: Implement P1 targets, reflectors, coins, and attempt rules
+    description: 'Complete the supported P1 entities and their Flame presentation using pure Dart rules:
+      required targets, simple bounce blocks, fixed-angle reflecting blocks, collectible coins, bounds,
+      and attempt limits.'
+    acceptance_criteria:
+    - Validated level data instantiates one or more required targets, simple bounce blocks, fixed-angle
+      reflectors, and collectible coins with matching Flame components.
+    - Collision tests verify expected reflected velocity within documented tolerances for normal and grazing
+      hits on both supported obstacle types.
+    - A coin can be collected only once in an attempt, each collected coin contributes exactly 10 attempt-score
+      points, and target/coin hit events are deterministic under replay.
+    - Tests verify win after all required targets, failure on timeout/out-of-bounds/destruction, and no
+      implementation of adjustable reflectors, gravity wells, black holes, anti-gravity, or player-controlled
+      equipment.
+    depends_on:
+    - SSG-006
+    - SSG-007
+    - SSG-008
+    type: Story
+    priority: Highest
+    subtasks: []
+  - id: SSG-011
+    summary: Implement configurable scoring, stars, coin awards, and unlock rules
+    description: Add pure Dart result calculation and progression rules. Avoid inventing global balance
+      values by reading base score, time bonus, failure penalty, and star thresholds from each validated
+      level.
+    acceptance_criteria:
+    - Tests demonstrate that configured base completion score, time bonus, collected-coin score, and failure
+      penalty produce the expected result, with every failed score floored at zero.
+    - Star evaluation uses ordered per-level thresholds and returns 0 for failure and 1-3 for qualifying
+      wins; invalid threshold ordering is rejected by level validation.
+    - A first successful completion awards the level's collected currency once, repeated wins mint no
+      additional currency from that level, and failure never deducts the saved coin balance.
+    - Winning returns authored next-node unlocks, while progression retains the maximum historical score
+      and stars rather than replacing them with a lower result.
+    - Provisional scoring values and the first-success coin policy are documented for owner review; shops,
+      inventory transactions, paid currency, ads, and subscriptions are absent.
+    depends_on:
+    - SSG-010
+    type: Story
+    priority: High
+    subtasks: []
+  - id: SSG-012
+    summary: Complete the in-level win, fail, and retry experience
+    description: Build the visible attempt loop around the simulation, including trajectory animation,
+      contact feedback, status overlays, retry, and return-to-map navigation.
+    acceptance_criteria:
+    - The HUD displays elapsed/remaining attempt time, targets completed, attempt score, and coins collected
+      without requiring network access.
+    - Target and coin contacts show visible feedback, with a reduced-motion mode that replaces nonessential
+      motion with a static or low-motion indication.
+    - Win and fail overlays expose accessible Retry and Return to Map actions; Retry resets transient
+      target, coin, score, time, and ball state without changing saved currency.
+    - Widget tests cover win, each supported failure reason, retry reset, return navigation, accessible
+      labels, and a small portrait viewport without clipped primary controls.
+    depends_on:
+    - SSG-008
+    - SSG-010
+    - SSG-011
+    type: Story
+    priority: Highest
+    subtasks: []
+  - id: SSG-013
+    summary: Author and validate ten progressively challenging levels
+    description: Create ten versioned local YAML levels and an authored unlock graph using only P1 mechanics.
+      Add replay evidence that each level has at least one successful launch input.
+    acceptance_criteria:
+    - Exactly ten bundled levels pass the schema and semantic validator and load without gameplay source-code
+      changes.
+    - The level set introduces launch positioning, multiple targets, bounce blocks, fixed-angle reflectors,
+      coins, and tighter limits progressively, while excluding every P2+ mechanic.
+    - Each level has a deterministic successful replay fixture that contacts all required targets and
+      completes within its configured time limit.
+    - The graph begins with level 1 unlocked, contains no dangling references or cycles that make a level
+      unreachable, and defines the next nodes unlocked by each win.
+    - Per-level scoring values and star thresholds are recorded as provisional balancing data requiring
+      product-owner review before content lock.
+    depends_on:
+    - SSG-009
+    - SSG-010
+    - SSG-011
+    type: Story
+    priority: High
+    subtasks: []
+  phase: P1
+- id: SSG-E04
+  summary: P1 Offline progression, settings, and MVP verification
+  description: Persist offline player state, expose the level map and settings experience, and verify
+    the complete vertical slice on supported platforms. This epic does not add login, cloud sync, analytics
+    SDKs, multiplayer, remote level packs, publishing, or a shop.
+  tasks:
+  - id: SSG-014
+    summary: Implement versioned local save storage and migration boundaries
+    description: Create a replaceable storage interface and local implementation for settings and progression,
+      with atomic updates and explicit save-format versioning.
+    acceptance_criteria:
+    - The pure Dart storage interface round-trips settings, unlocked node IDs, best score, best stars,
+      coin balance, and per-level first-win coin-award state.
+    - Save data contains a format version, and tests cover a migration from one older fixture plus safe
+      handling of missing, corrupt, and unsupported-version data.
+    - 'Progress updates are atomic from the domain perspective: a simulated write failure leaves the previously
+      readable save unchanged.'
+    - Repeated completion preserves maximum score/stars, never duplicates first-win currency, and never
+      permits a negative coin balance.
+    - The implementation performs no network calls and contains no account, cloud-sync, purchase, or remote-content
+      API.
+    depends_on:
+    - SSG-011
+    type: Task
+    priority: Highest
+    subtasks: []
+  - id: SSG-015
+    summary: Build the level map and accessible settings screens
+    description: Provide the portrait-first main map and settings UI with adaptive macOS behavior, displaying
+      saved progression and offering locally persisted presentation/audio preferences.
+    acceptance_criteria:
+    - The map renders all ten authored graph nodes, visibly distinguishes locked, available, and completed
+      states, shows 1-3 best stars for completed levels, and displays current coins.
+    - Selecting an available node opens its level, while locked nodes cannot start and expose an accessibility
+      label explaining their locked state.
+    - Settings persist separate music and sound-effects toggles, reduced-motion preference, and at least
+      two basic non-premium themes across application restart.
+    - Widget tests cover node states, branching graph layout, coin/star display, locked-node behavior,
+      settings persistence, accessibility labels, a small mobile viewport, and a resized macOS-style viewport.
+    - No premium theme, advertisement, purchase, subscription, shop, login, multiplayer, or download control
+      is displayed.
+    depends_on:
+    - SSG-012
+    - SSG-013
+    - SSG-014
+    type: Story
+    priority: Highest
+    subtasks: []
+  - id: SSG-016
+    summary: Verify the complete offline MVP flow and platform smoke builds
+    description: Add end-to-end coverage and record supported-platform evidence for the P1 slice without
+      deploying or publishing it.
+    acceptance_criteria:
+    - An integration test completes launch, target contact, win, progress save, application restart, map
+      refresh, and next-node unlock using deterministic input.
+    - A second integration test covers failure, retry, successful completion, first-win coin award, and
+      a repeated win that improves score without minting the same level coins again.
+    - All bundled assets validate, all replay fixtures pass, and `dart format --output=none --set-exit-if-changed
+      .`, `flutter analyze`, `flutter test`, and supported integration tests complete successfully.
+    - Android and macOS debug/profile smoke results are recorded where toolchains or devices are available;
+      iOS build/test evidence is recorded only on an available supported Mac/Xcode environment, with unavailable
+      checks explicitly noted.
+    - The verification report includes accessibility checks, compact-screen results, mouse-control results,
+      and measured frame/simulation baselines, and explicitly states that no store upload, signing, production
+      release, ads, purchases, subscriptions, multiplayer, or remote download was performed.
+    depends_on:
+    - SSG-013
+    - SSG-014
+    - SSG-015
+    type: Task
+    priority: High
+    subtasks: []
+  phase: P1

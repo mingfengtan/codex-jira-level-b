@@ -220,11 +220,22 @@ class Jira:
         return self.call("POST", "/issue", {"fields": fields})["key"]
 
     def blocks(self, blocker: str, blocked: str) -> None:
+        """Create blocker -> blocked, using Jira Cloud's link-end conventions.
+
+        For Jira's standard Blocks type, the *blocked* issue is the
+        outwardIssue of the creation request, and the *blocker* is the
+        inwardIssue. On GET blocked issue, blocker then appears in
+        issuelinks[].inwardIssue as 'is blocked by'.
+        """
         self.call("POST", "/issueLink", {
             "type": {"name": "Blocks"},
-            "outwardIssue": {"key": blocker},
-            "inwardIssue": {"key": blocked},
+            "outwardIssue": {"key": blocked},
+            "inwardIssue": {"key": blocker},
         })
+
+    def remove_link(self, link_id: str) -> None:
+        # Link IDs originate from GET /issue and are never fabricated.
+        self.call("DELETE", f"/issueLink/{urllib.parse.quote(str(link_id), safe='')}")
 
 
 def safe_env() -> dict[str, str]:
@@ -628,6 +639,78 @@ def apply_plan(cfg: Config, plan_path: Path) -> None:
                         print(f"Dependency {pair}")
     print(f"Created/reconciled tickets; mapping: {state_file}")
     print("New tickets are unapproved: human must set Ready AND codex-ready.")
+
+def audit_dependencies(cfg: Config, plan_path: Path, fix: bool = False) -> None:
+    """Audit/repair *only* dependency pairs declared in plan.yaml.
+
+    This command does not reconstruct or delete unrelated Jira links. Any
+    deletion requires explicit --fix --yes and a link ID returned by Jira.
+    All operations are repeatable after an interruption.
+    """
+    plan = read_plan(plan_path)
+    validate_plan(plan, cfg.project)
+    state_file = plan_path.with_name(plan_path.stem + ".applied.json")
+    if not state_file.exists():
+        raise ValueError(f"Missing {state_file}; cannot map plan IDs to Jira keys")
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    issues = state.get("issues", {})
+    jira = Jira(cfg)
+    expected = []
+    for epic in plan["epics"]:
+        for task in epic["tasks"]:
+            for item in [task, *task.get("subtasks", [])]:
+                for dep in item["depends_on"]:
+                    if dep not in issues or item["id"] not in issues:
+                        raise ValueError(f"Missing applied Jira mapping for {dep} -> {item['id']}")
+                    expected.append((dep, item["id"], issues[dep], issues[item["id"]]))
+
+    if not expected:
+        print("No plan dependencies to audit.")
+        return
+
+    # Indexing by the blocked endpoint keeps read traffic modest and inspects
+    # both link directions without relying on the cached plan.applied.json links.
+    cache = {}
+    problems = 0
+    for dep_id, item_id, blocker, blocked in expected:
+        if blocked not in cache:
+            cache[blocked] = jira.issue(blocked)
+        links = cache[blocked].get("fields", {}).get("issuelinks", [])
+        correct = [link for link in links
+                   if link.get("type", {}).get("name", "").casefold() == "blocks"
+                   and link.get("inwardIssue", {}).get("key") == blocker]
+        reversed_links = [link for link in links
+                          if link.get("type", {}).get("name", "").casefold() == "blocks"
+                          and link.get("outwardIssue", {}).get("key") == blocker]
+        status = "OK" if correct and not reversed_links else (
+            "BOTH" if correct and reversed_links else
+            "REVERSED" if reversed_links else "MISSING")
+        print(f"{dep_id} ({blocker}) blocks {item_id} ({blocked}): {status}")
+        if status == "OK":
+            continue
+        problems += 1
+        if not fix:
+            continue
+        # A missing link ID must not trigger a guessed DELETE request.
+        for link in reversed_links:
+            if not link.get("id"):
+                raise ValueError(f"Cannot delete reversed {blocked}/{blocker} link without Jira link ID")
+        for link in reversed_links:
+            jira.remove_link(str(link["id"]))
+            print(f"  Deleted reversed Jira link {link['id']}")
+        if not correct:
+            jira.blocks(blocker, blocked)
+            print(f"  Created correct link: {blocker} blocks {blocked}")
+        # Re-fetch after mutation so subsequent dependency pairs see fresh links.
+        cache.pop(blocked, None)
+    if problems and not fix:
+        print(f"Found {problems} incorrect/missing dependencies. To repair, review this output, "
+              f"then run: python3 orchestrator.py audit-dependencies {plan_path} --fix --yes")
+    elif fix:
+        print(f"Dependency repair complete ({problems} pair(s) corrected).")
+    else:
+        print("All declared Jira dependencies match the YAML plan.")
+
 
 def ensure_git_repo(cfg: Config) -> None:
     actual = Path(run_command(["git", "-C", str(cfg.repo), "rev-parse", "--show-toplevel"])).resolve()
@@ -1297,6 +1380,10 @@ def main() -> None:
     apply_parser = sub.add_parser("apply-plan", help="Idempotently create Jira tickets/links")
     apply_parser.add_argument("plan", type=Path)
     apply_parser.add_argument("--yes", action="store_true")
+    audit_parser = sub.add_parser("audit-dependencies", help="Inspect existing Jira Blocks links versus plan.yaml")
+    audit_parser.add_argument("plan", type=Path)
+    audit_parser.add_argument("--fix", action="store_true", help="Delete reversed links and create correct ones")
+    audit_parser.add_argument("--yes", action="store_true", help="Confirm Jira link repair")
     validate_parser = sub.add_parser("validate-plan", help="Validate plan without Jira changes")
     validate_parser.add_argument("plan", type=Path)
     once_parser = sub.add_parser("once", help="Execute one approved Jira ticket")
@@ -1332,6 +1419,14 @@ def main() -> None:
             parser.error("apply-plan writes Jira tickets; add --yes after review")
         with single_worker_lock(cfg.worktree_root):
             apply_plan(cfg, args.plan)
+    elif args.command == "audit-dependencies":
+        if args.fix and not args.yes:
+            parser.error("Repair changes Jira links; add --yes after reviewing audit output")
+        if args.fix:
+            with single_worker_lock(cfg.worktree_root):
+                audit_dependencies(cfg, args.plan, fix=True)
+        else:
+            audit_dependencies(cfg, args.plan, fix=False)
     elif args.command == "once":
         once(cfg, args.dry_run)
     elif args.command == "bootstrap":

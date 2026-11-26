@@ -204,3 +204,37 @@ Confirm the update with:
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+## Fix wrong-direction Jira blockers (dependency hotfix)
+
+Earlier versions of this MVP created `Blocks` links with the Jira REST API's
+inward/outward ends reversed. The YAML plan itself was correct. Existing links
+**must be audited and explicitly repaired**; replacing the script alone does not
+repair them because `plan.applied.json` already marks the pair applied.
+
+From your scheduler directory, **with your existing `.env` and `plan.applied.json`**:
+
+```bash
+python3 orchestrator.py audit-dependencies plan.yaml
+```
+
+Read the `REVERSED`, `MISSING`, and `BOTH` lines. If the mapping looks right,
+stop any scheduled workers, back up `plan.applied.json`, and run:
+
+```bash
+python3 orchestrator.py audit-dependencies plan.yaml --fix --yes
+python3 orchestrator.py audit-dependencies plan.yaml
+python3 orchestrator.py once --dry-run
+```
+
+Repair modifies **only the blocker pairs explicitly listed by `depends_on` in
+this plan**. It deletes reversed Jira `Blocks` links for these pairs and adds
+missing correct links. It leaves all unrelated Jira links untouched. It fetches
+link IDs from Jira before deletion, and a repeated repair is idempotent.
+
+**Do not delete `plan.applied.json` or re-run `apply-plan` to repair existing
+links**: that can lose the stable mapping and create duplicate Jira issues.
+
+The standard Jira `Blocks` link type is assumed to use the English link name
+`Blocks`. If your site customizes that link type's name or directions, adjust
+and verify the link semantics before using `--fix`.
