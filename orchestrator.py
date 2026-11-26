@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import copy
 import fcntl
 import json
 import os
@@ -294,6 +295,49 @@ def load_plan_schema(path: Path = SCHEMA) -> dict:
     return schema
 
 
+def codex_output_schema(schema: dict) -> dict:
+    """Return a strict Codex Structured Outputs schema from the YAML schema.
+
+    The YAML schema remains the authoritative *local validation* schema and may
+    have optional fields. Structured Outputs requires every property of every
+    object (including nested objects) in `required`. For generated plans those
+    fields must all be present; empty `subtasks: []` is valid.
+
+    Do not modify `schema` in-place: local validation intentionally continues
+    to accept optional `phase`, `type`, `priority`, and `subtasks`.
+    """
+    output = copy.deepcopy(schema)
+
+    def walk(node: object) -> None:
+        if isinstance(node, list):
+            for child in node:
+                walk(child)
+            return
+        if not isinstance(node, dict):
+            return
+        # Only descend through known JSON Schema nodes; never through enum,
+        # default, description or example values.
+        if node.get("type") == "object":
+            properties = node.get("properties", {})
+            if not isinstance(properties, dict):
+                raise ValueError("Codex output schema object properties must be a mapping")
+            node["additionalProperties"] = False
+            node["required"] = list(properties)
+        for name in ("properties", "$defs", "definitions", "patternProperties"):
+            entries = node.get(name)
+            if isinstance(entries, dict):
+                for child in entries.values():
+                    walk(child)
+        for name in ("items", "additionalProperties", "not", "if", "then", "else"):
+            walk(node.get(name))
+        for name in ("allOf", "anyOf", "oneOf", "prefixItems"):
+            walk(node.get(name))
+
+    walk(output)
+    Draft202012Validator.check_schema(output)
+    return output
+
+
 def validate_plan_schema(plan: dict, schema: dict) -> None:
     """Validate plan shape using plan.schema.yaml; no Jira operations."""
     errors = sorted(Draft202012Validator(schema).iter_errors(plan),
@@ -376,7 +420,8 @@ BRIEF:\n{brief[:30000]}"""
     with tempfile.TemporaryDirectory(prefix="codex-jira-plan-") as tmp_dir:
         model_output = Path(tmp_dir) / "codex-plan.json"
         json_schema = Path(tmp_dir) / "plan.schema.json"
-        json_schema.write_text(json.dumps(load_plan_schema(), ensure_ascii=False), encoding="utf-8")
+        json_schema.write_text(json.dumps(codex_output_schema(load_plan_schema()),
+                                          ensure_ascii=False), encoding="utf-8")
         run_command(codex_args(cfg.repo, "read-only") + ["--output-schema", str(json_schema),
                     "--output-last-message", str(model_output), prompt], cwd=cfg.repo,
                     timeout=cfg.codex_timeout, env=safe_env())

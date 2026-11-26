@@ -148,10 +148,11 @@ class TestYamlPlans(unittest.TestCase):
         brief.write_text("Build a small app")
         output = self.dir / "plan.yaml"
         def fake_run(cmd, **kwargs):
-            from orchestrator import load_plan_schema
+            from orchestrator import load_plan_schema, codex_output_schema
             output_schema_path = Path(cmd[cmd.index("--output-schema") + 1])
             self.assertEqual(output_schema_path.suffix, ".json")
-            self.assertEqual(json.loads(output_schema_path.read_text()), load_plan_schema())
+            self.assertEqual(json.loads(output_schema_path.read_text()),
+                             codex_output_schema(load_plan_schema()))
             destination = Path(cmd[cmd.index("--output-last-message") + 1])
             destination.write_text(json.dumps(example))
             return ""

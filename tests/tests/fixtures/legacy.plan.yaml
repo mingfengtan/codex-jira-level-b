@@ -1,0 +1,46 @@
+# Example only. Change `project` to your JIRA_PROJECT_KEY in .env.
+# IDs are local stable identifiers, NOT Jira issue keys.
+# Applying the plan creates tickets but does not authorize execution.
+project: AIDEV
+epics:
+  - id: auth
+    summary: Authentication and user management
+    description: >-
+      Provide secure application login and authenticated sessions.
+    tasks:
+      - id: auth-database
+        summary: Define the user data model
+        description: >-
+          Add database migrations and repository methods for users.
+        acceptance_criteria:
+          - A users table exists with a unique email address.
+          - Database migrations run successfully in a clean environment.
+          - Automated tests cover user creation and duplicate emails.
+        depends_on: []
+
+      - id: auth-api
+        summary: Implement login API
+        description: >-
+          Implement POST /api/login, credential validation, and session creation.
+        acceptance_criteria:
+          - Valid credentials return a session token.
+          - Invalid credentials return 401 without revealing sensitive details.
+          - Unit tests cover successful and failed login.
+        depends_on:
+          - auth-database
+
+  - id: dashboard
+    summary: Dashboard experience
+    description: >-
+      Provide a logged-in dashboard that consumes the application API.
+    tasks:
+      - id: dashboard-shell
+        summary: Create dashboard shell
+        description: >-
+          Create the authenticated dashboard route and navigation components.
+        acceptance_criteria:
+          - An authenticated user can open the dashboard.
+          - Unauthenticated users are redirected to the login page.
+          - The dashboard layout has component tests.
+        depends_on:
+          - auth-api

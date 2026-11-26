@@ -75,7 +75,7 @@ This requires an online host. Turn off cron or omit `--bootstrap` if you want to
 
 ## Schema, Git, and safety notes
 
-- `plan.schema.yaml` is parsed using PyYAML's safe loader, validated with `jsonschema`, and converted temporarily to JSON because `codex exec --output-schema` accepts a JSON Schema file. You maintain **one schema YAML**.
+- `plan.schema.yaml` is parsed using PyYAML's safe loader and validated with `jsonschema`. For `codex exec --output-schema`, the scheduler **recursively creates a strict version in a temporary JSON file** (all nested properties required and `additionalProperties: false`). The editable YAML remains the only maintained schema and can still treat `phase`, `type`, `priority`, and `subtasks` as optional for hand-written plans. The model-generated plan will provide those fields (e.g. `subtasks: []`).
 - `plan.example.game.yaml` contains a sample `project: AIDEV`: replace it with your actual `JIRA_PROJECT_KEY`. If using it instead of AI generation, copy to `plan.yaml`, validate, then bootstrap/apply.
 - Plan `type` can be `Task`, `Story` or `Bug`. Nested `subtasks` are created using Jira's actual subtask type ID. `priority` is a human-facing hint; change priority in Jira for queue ordering. Dependencies refer to stable plan IDs. Don't create dependency cycles.
 - Codex is instructed to avoid commits/pushes/Jira calls; the orchestrator owns remote operations. Protect the GitHub `main` branch with mandatory PR review and CI checks; approve and merge manually. Native Jira coding-agent triggers should not run on the same issues.
@@ -155,3 +155,20 @@ This release also removes `--ask-for-approval never` from `codex exec`
 because Codex CLI 0.172.0 rejects that argument when placed after `exec`.
 Noninteractive `exec` uses noninteractive approval behavior and the configured
 `--sandbox` restriction; do not use the dangerous bypass flags.
+
+
+## Structured output schema compatibility (Codex CLI)
+
+If Codex reports `Invalid schema for response_format 'codex_output_schema'`
+with `Missing 'phase'`, the previous scheduler forwarded the YAML schema
+unchanged to the strict API. This version automatically converts all nested
+object properties to required **only for the temporary Codex output schema**,
+leaving `plan.schema.yaml` and local plan validation unchanged. Replace
+`orchestrator.py`, then rerun `python3 orchestrator.py plan project_brief.md --out plan.yaml`.
+This error occurs before a plan is generated and does not create Jira tickets.
+
+Confirm the update with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
