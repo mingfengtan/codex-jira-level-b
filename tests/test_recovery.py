@@ -84,7 +84,7 @@ if mode == 'quota':
 if mode == 'error':
  print(json.dumps({'type':'turn.failed','error':{'message':'temporary connection reset'}}), flush=True)
  sys.exit(1)
-pathlib.Path('new.py').write_text('value = 456\\n' if mode == 'fix' else 'value = 123\\n')
+pathlib.Path('new.py').write_text('value = 456\\n' if mode == 'fix' or (mode == 'auto-fix' and 'resume' in args) else 'value = 123\\n')
 if '--output-last-message' in args:
  pathlib.Path(args[args.index('--output-last-message')+1]).write_text('Implemented safely')
 print(json.dumps({'type':'turn.completed'}), flush=True)
@@ -195,21 +195,90 @@ sys.exit('unknown gh args '+str(args))
         once(self.cfg)
         self.assertEqual(load_job(self.cfg, 'AIDEV-12')['stage'], 'manual')
 
-    def test_test_failures_send_codex_back_to_repair_then_resume(self):
+    def test_test_failures_send_codex_back_to_repair_in_same_invocation(self):
         from dataclasses import replace
         cfg = replace(self.cfg, check_command='python3 -c "from pathlib import Path; assert \'456\' in Path(\'new.py\').read_text()"')
+        self.mode.write_text('auto-fix')
         once(cfg)
         job = load_job(cfg, 'AIDEV-12')
-        self.assertEqual(job['stage'], 'codex')
+        self.assertEqual(job['stage'], 'complete')
         self.assertEqual(job['verify_repairs'], 1)
-        self.assertIn('verification', job['last_error'].lower())
-        self.mode.write_text('fix')
-        job['next_retry_at'] = '2000-01-01T00:00:00+00:00'
-        persist_job(cfg, job)
-        once(cfg)
-        self.assertEqual(load_job(cfg, 'AIDEV-12')['stage'], 'complete')
+        self.assertIsNone(job['repair_context'])
+        self.assertIsNone(job['next_retry_at'])
         calls = [json.loads(line) for line in self.logargs.read_text().splitlines()]
+        self.assertEqual(len(calls), 2)
         self.assertIn('resume', calls[1])
+        self.assertTrue(any('latest verification output' in arg for arg in calls[1]))
+        self.assertEqual(len(json.loads(self.prstore.read_text())), 1)
+
+    def test_repeated_failing_verifications_stop_after_budget_without_pushing(self):
+        from dataclasses import replace
+        cfg = replace(self.cfg, max_test_repairs=2,
+                      check_command='python3 -c "from pathlib import Path; assert \'456\' in Path(\'new.py\').read_text()"')
+        once(cfg)
+        job = load_job(cfg, 'AIDEV-12')
+        self.assertEqual(job['stage'], 'manual')
+        self.assertEqual(job['verify_repairs'], 3)
+        self.assertEqual(job['failure_kind'], 'manual')
+        self.assertEqual(job['resume_stage'], 'codex')
+        self.assertIn('after 2 Codex repair attempts', job['last_error'])
+        self.assertEqual(len(self.logargs.read_text().splitlines()), 3)
+        self.assertEqual(json.loads(self.prstore.read_text()), [])
+        self.assertEqual(self.data['AIDEV-12']['fields']['status']['name'], 'Blocked')
+
+    def test_old_transient_verification_pause_auto_resumes_without_cooldown(self):
+        job = new_job(self.cfg, self.data['AIDEV-12'])
+        job.update(stage='codex', failure_kind='transient',
+                   repair_context='ValueError: expected 456 but got 123',
+                   last_error='Verification failed; Codex will attempt repair. See /test.log',
+                   next_retry_at='2099-01-01T00:00:00+00:00', verify_repairs=1)
+        persist_job(self.cfg, job)
+        self.mode.write_text('fix')
+        once(self.cfg)
+        result = load_job(self.cfg, 'AIDEV-12')
+        self.assertEqual(result['stage'], 'complete')
+        self.assertIsNone(result['next_retry_at'])
+        self.assertEqual(result['verify_repairs'], 1)
+
+    def test_budget_raise_unblocks_only_verification_manual_stop(self):
+        from dataclasses import replace
+        job = new_job(self.cfg, self.data['AIDEV-12'])
+        job.update(stage='manual', resume_stage='codex', failure_kind='manual',
+                   repair_context='Expected 456; got 123', verify_repairs=3,
+                   last_error='Verification failed 3 times; inspect /test.log')
+        persist_job(self.cfg, job)
+        self.data['AIDEV-12']['fields']['status']['name'] = 'Blocked'
+        self.mode.write_text('fix')
+        cfg = replace(self.cfg, max_test_repairs=4)
+        once(cfg)
+        result = load_job(cfg, 'AIDEV-12')
+        self.assertEqual(result['stage'], 'complete')
+        self.assertEqual(result['verify_repairs'], 3)
+        self.assertEqual(self.data['AIDEV-12']['fields']['status']['name'], 'In Review')
+
+    def test_old_manual_from_transient_verification_retries_auto_resumes(self):
+        job = new_job(self.cfg, self.data['AIDEV-12'])
+        job.update(stage='manual', resume_stage='codex', failure_kind='transient',
+                   repair_context='Flutter test failed', verify_repairs=1,
+                   last_error='Verification failed; Codex will attempt repair. See /test.log')
+        persist_job(self.cfg, job)
+        self.data['AIDEV-12']['fields']['status']['name'] = 'Blocked'
+        self.mode.write_text('fix')
+        once(self.cfg)
+        self.assertEqual(load_job(self.cfg, 'AIDEV-12')['stage'], 'complete')
+        self.assertEqual(self.data['AIDEV-12']['fields']['status']['name'], 'In Review')
+
+    def test_other_manual_failures_remain_blocked_after_budget_raise(self):
+        from dataclasses import replace
+        job = new_job(self.cfg, self.data['AIDEV-12'])
+        job.update(stage='manual', resume_stage='codex', failure_kind='manual',
+                   repair_context='irrelevant', verify_repairs=3,
+                   last_error='Authorization label removed')
+        persist_job(self.cfg, job)
+        self.data['AIDEV-12']['fields']['status']['name'] = 'Blocked'
+        once(replace(self.cfg, max_test_repairs=4))
+        self.assertEqual(load_job(self.cfg, 'AIDEV-12')['stage'], 'manual')
+        self.assertFalse(self.logargs.exists())
 
     def test_unexpected_cli_error_is_bounded_and_recoverable(self):
         self.mode.write_text('error')

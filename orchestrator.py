@@ -1046,7 +1046,14 @@ def run_codex_stream(cfg: Config, job: dict, prompt: str, log: Path, last_messag
         persist_job(cfg, job)
 
 
-def verify_tests(cfg: Config, job: dict, log: Path) -> None:
+def verify_tests(cfg: Config, job: dict, log: Path) -> bool:
+    """Verify the worktree, returning False when a bounded Codex repair is needed.
+
+    A failing application test is not a transient infrastructure failure: keep the
+    error output in the checkpoint and immediately resume Codex in the same run.
+    This function persists the `codex` stage before returning so interruption is
+    safe. Only exhausted repair budgets (or actual subprocess errors) raise.
+    """
     process = subprocess.Popen(["bash", "-lc", cfg.check_command], cwd=job["worktree"],
                                env=safe_env(), stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1066,15 +1073,24 @@ def verify_tests(cfg: Config, job: dict, log: Path) -> None:
     with log.open("ab") as stream:
         stream.write(f"\n--- VERIFICATION {instant()} ---\n".encode() + output[-200000:])
     if process.returncode:
-        context = output.decode("utf-8", errors="replace")[-6000:]
-        job["verify_repairs"] += 1
+        context = output.decode("utf-8", errors="replace")[-12000:]
+        job["verify_repairs"] = int(job.get("verify_repairs") or 0) + 1
         job["repair_context"] = context
-        if job["verify_repairs"] > cfg.max_test_repairs:
-            raise WorkerError(f"Verification failed {job['verify_repairs']} times; inspect {log}", "manual")
         job["stage"] = "codex"
         job["codex_complete"] = False
         persist_job(cfg, job)
-        raise WorkerError(f"Verification failed; Codex will attempt repair. See {log}", "transient")
+        if job["verify_repairs"] > cfg.max_test_repairs:
+            raise WorkerError(
+                f"Verification failed {job['verify_repairs']} times after "
+                f"{cfg.max_test_repairs} Codex repair attempts; inspect {log}", "manual"
+            )
+        print(f"{job['key']}: verification failed; sending test output to Codex "
+              f"immediately (repair {job['verify_repairs']}/{cfg.max_test_repairs})", flush=True)
+        return False
+    print(f"{job['key']}: verification passed", flush=True)
+    job["repair_context"] = None
+    persist_job(cfg, job)
+    return True
 
 
 def git_commits_ahead(cfg: Config, job: dict) -> list[str]:
@@ -1236,7 +1252,10 @@ End with a concise summary, tests and outstanding risks.
                 if job.get("session_id"):
                     continuation = (f"Continue working on Jira {key}. Inspect existing changes and finish acceptance criteria. "
                                     "Preserve previous work; do not commit, push, or open PRs.\n" +
-                                    ("Fix these verification failures:\n" + job["repair_context"]
+                                    ("The verification command failed. Fix the underlying implementation or "
+                                     "test setup, reproduce the failure with focused tests, and rerun them. "
+                                     "Do not weaken valid assertions to make tests pass. "
+                                     "Here is the latest verification output:\n" + job["repair_context"]
                                      if job.get("repair_context") else "Review status and resume unfinished implementation."))
                 elif job["codex_attempts"] > 1 or job.get("adopted"):
                     continuation += "\nThis worktree contains earlier partial work; inspect it and continue, do not restart."
@@ -1246,7 +1265,10 @@ End with a concise summary, tests and outstanding risks.
                 job["repair_context"] = None
                 advance(cfg, job, "verify")
             elif phase == "verify":
-                verify_tests(cfg, job, log)
+                if not verify_tests(cfg, job, log):
+                    # Failure output and codex checkpoint are already persisted.
+                    # Do not set a retry cooldown or exit: repair in this run.
+                    continue
                 advance(cfg, job, "commit")
             elif phase == "commit":
                 commit_if_needed(cfg, job, title)
@@ -1351,6 +1373,65 @@ def single_worker_lock(root: Path):
         yield
 
 
+def resume_saved_verification_repair(cfg: Config, jira: Jira, job: dict, *, dry_run: bool = False) -> bool:
+    """Upgrade old verification pauses to the immediate-repair behavior.
+
+    This intentionally handles *only* the old verification-only cooldown and an
+    exhausted verification budget that has subsequently been raised in config.
+    Quota, Codex, Git, authorization, and unrelated manual failures stay paused.
+    """
+    error = str(job.get("last_error") or "")
+    if (job.get("stage") == "codex"
+            and job.get("failure_kind") == "transient"
+            and error.startswith("Verification failed; Codex will attempt repair.")
+            and job.get("repair_context")):
+        if dry_run:
+            print(f"DRY RUN: would resume saved verification repair for {job['key']} immediately")
+            return True
+        job["next_retry_at"] = None
+        job["failure_kind"] = None
+        job["last_error"] = None
+        job["attempts"] = 0
+        persist_job(cfg, job)
+        print(f"{job['key']}: old verification retry cooldown cleared; resuming Codex repair", flush=True)
+        return True
+
+    count = int(job.get("verify_repairs") or 0)
+    old_cooldown_exhausted = error.startswith("Verification failed; Codex will attempt repair.")
+    repair_budget_exhausted = bool(re.match(r"^Verification failed \d+ times(?:;| after )", error))
+    if (job.get("stage") != "manual"
+            or job.get("resume_stage") != "codex"
+            or not (old_cooldown_exhausted or repair_budget_exhausted)
+            or not job.get("repair_context")
+            or count > cfg.max_test_repairs):
+        return False
+    if dry_run:
+        print(f"DRY RUN: would resume {job['key']} verification repairs "
+              f"({count} failures; configured maximum {cfg.max_test_repairs})")
+        return True
+    issue = jira.issue(job["key"])
+    if cfg.ready_label not in issue.get("fields", {}).get("labels", []):
+        print(f"{job['key']}: authorization label removed; keeping manual stop", flush=True)
+        return False
+    current = issue_status(issue).casefold()
+    if current == "done" or issue.get("fields", {}).get("status", {}).get("statusCategory", {}).get("key") == "done":
+        return False
+    if current == cfg.blocked_status.casefold():
+        jira.transition(job["key"], cfg.in_progress_status)
+    elif current not in {cfg.ready_status.casefold(), cfg.in_progress_status.casefold()}:
+        return False
+    job["stage"] = "codex"
+    job.pop("resume_stage", None)
+    job["next_retry_at"] = None
+    job["failure_kind"] = None
+    job["last_error"] = None
+    job["attempts"] = 0
+    persist_job(cfg, job)
+    print(f"{job['key']}: MAX_TEST_REPAIRS now {cfg.max_test_repairs}; "
+          f"resuming after {count} failed verifications", flush=True)
+    return True
+
+
 def once(cfg: Config, dry_run: bool = False, already_locked: bool = False) -> None:
     """Resume an interrupted job first, otherwise claim one authorized Ready task."""
     ensure_git_repo(cfg)
@@ -1358,6 +1439,11 @@ def once(cfg: Config, dry_run: bool = False, already_locked: bool = False) -> No
     lock = contextlib.nullcontext() if already_locked else single_worker_lock(cfg.worktree_root)
     with lock:
         jobs = all_jobs(cfg)
+        # Old versions paused after a unit-test failure. A repair is now eligible
+        # immediately; do not make users manually clear its old retry timestamp.
+        for saved in jobs:
+            if resume_saved_verification_repair(cfg, jira, saved, dry_run=dry_run) and dry_run:
+                return
         # Quota exhaustion is account-wide. Do not start new tickets while waiting.
         quota_jobs = [job for job in jobs if job.get("failure_kind") == "quota"
                       and job["stage"] not in {"manual", "complete"}]
