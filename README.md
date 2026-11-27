@@ -342,3 +342,54 @@ are not overwritten or re-posted just to change formatting.
   pause for manual intervention; they are **not** auto-merged or force-pushed.
 - Logs and saved comments contain proprietary code context. Keep the scheduler
   state and `.env` out of version control.
+
+
+### Auto-repair failing checks during AI review fixes
+
+The review worker now distinguishes **failed Dart/Flutter tests or analysis**
+from **environment/configuration failures** while verifying Agent A's review
+fixes. The latter are sent to human intervention without consuming model quota.
+For recognizable application failures it writes a restricted log to:
+
+```text
+~/.codex-jira-worktrees/review/logs/SSG-8-fix-verify.log
+```
+
+Then it checkpoints `fix_test_repair` with the failure output. The next
+`review-once` or `tick --review` invocation resumes **the same Agent A Codex
+thread** using its stored session ID and asks for a focused repair. A later
+invocation re-runs verification. On success, the scheduler continues to
+commit, push, and re-review on the same GitHub PR.
+
+```dotenv
+MAX_REVIEW_TEST_REPAIRS=2
+```
+
+`MAX_REVIEW_TEST_REPAIRS` is the number of *additional repair attempts per
+review-fix round*, separate from `MAX_AUTO_REVIEW_FIXES` (how many cycles of
+Agent B findings -> Agent A fixes are allowed). Repeated failures stop at
+`manual` rather than retrying tests indefinitely. Unknown failures are also
+left for human investigation. **No merging or Jira Done transition is added.**
+
+Upgrade for a checkpoint already paused at `fix_verify` (such as SSG-8):
+stop the scheduler, back up the scheduler and review checkpoint directory,
+replace `review_worker.py` with the patched file, and run:
+
+```bash
+python3 orchestrator.py review-status
+python3 orchestrator.py review-retry SSG-8
+python3 orchestrator.py review-once
+python3 orchestrator.py review-status
+```
+
+If test failures are recognized, expect `fix_test_repair` in the status output.
+Run `review-once` again to let Agent A perform one repair, then again for host
+verification. Monitor the detailed verification output with:
+
+```bash
+tail -f ~/.codex-jira-worktrees/review/logs/SSG-8-fix-verify.log
+```
+
+The successful task still requires GitHub CI, AI re-review, and human PR review
+before merging. If the checkpoint is already `manual`, this recovery procedure
+cannot restart it automatically: inspect the cause and checkpoint first.
