@@ -23,6 +23,37 @@ This repository is the **orchestrator**, not the game code. `REPO_PATH` in `.env
 
 > The Python `flock` lock is for a **single Linux/macOS host**, not distributed coordination. The Python worker deliberately passes the Jira token only to the controller process, not to Codex or project test subprocesses. However, untrusted repository scripts still pose execution risks; use a disposable runner for untrusted code.
 
+## Increasing automatic review fix rounds
+
+The `.env` setting `MAX_AUTO_REVIEW_FIXES` is read on each scheduler invocation.
+If an existing PR reached `manual` **specifically** because its prior automatic
+review-fix budget was exhausted, increasing this setting beyond its saved
+`fix_rounds` count now automatically resumes that PR on the next
+`review-run` or `review-once`. It uses Agent B's saved `changes_requested`
+findings and preserves the review/fix history. No checkpoint editing,
+`review-retry`, or `review-resume` is necessary for this case.
+
+For example, if `SSG-8` has `fixes=2`, set `MAX_AUTO_REVIEW_FIXES=4` in
+**`.env`** (not just `.env.example`) and execute:
+
+```bash
+python3 orchestrator.py review-run --issue-key SSG-8 --dry-run
+python3 orchestrator.py review-run --issue-key SSG-8
+```
+
+`review-status` shows `fixes=2/4` and a `raise-limit recovery available`
+marker while that old checkpoint is eligible to resume. Only an exact budget-exhausted
+stop with a saved Agent B review result can automatically recover. Other
+manual stops still require investigation. The PR remains human-merge-only.
+
+**Config precedence:** the scheduler's `.env` loader uses `setdefault`, so an
+already exported shell environment variable overrides `.env`. To check the
+actual value read by the scheduler:
+
+```bash
+python3 -c 'import orchestrator, review_worker; orchestrator.load_env(); print(review_worker.config()["max_fixes"])'
+```
+
 ## Modes: choose one
 
 ### A. Review plan locally before creating Jira issues (safer first run)
@@ -393,3 +424,75 @@ tail -f ~/.codex-jira-worktrees/review/logs/SSG-8-fix-verify.log
 The successful task still requires GitHub CI, AI re-review, and human PR review
 before merging. If the checkpoint is already `manual`, this recovery procedure
 cannot restart it automatically: inspect the cause and checkpoint first.
+
+
+### Continuous PR review runner (`review-run`)
+
+The original `review-once` and `tick --review` still work as one-shot,
+checkpoint-by-checkpoint commands. To avoid manually advancing `recheck`,
+`review`, `fix`, verification, and `ci` stages, use **`review-run`** instead:
+
+```bash
+# Runs one eligible PR review end-to-end, or until a real wait/manual stop.
+python3 orchestrator.py review-run
+
+# Target a particular ticket; checks PR HEAD / CI immediately when waiting.
+python3 orchestrator.py review-run --issue-key SSG-8
+
+# Short bounded interactive run (saves state if it must exit).
+python3 orchestrator.py review-run --issue-key SSG-8 --max-minutes 30
+
+# Preview selection; no Codex calls.
+python3 orchestrator.py review-run --dry-run
+python3 orchestrator.py review-status
+```
+
+Required setting: `AUTO_REVIEW_ENABLED=true`. Configurable polling defaults:
+
+```dotenv
+REVIEW_RUN_MAX_MINUTES=90
+REVIEW_HEAD_POLL_SECONDS=3
+REVIEW_HEAD_WAIT_TIMEOUT=120
+REVIEW_CI_POLL_SECONDS=15
+REVIEW_CI_WAIT_TIMEOUT=900
+```
+
+On each invocation, the runner picks **one PR** and uses the existing
+saved JSON checkpoint. It automatically advances through Agent B's review,
+Agent A's bounded fixes, test-failure repairs, same-branch commit/push,
+PR-head synchronization, another review, and GitHub CI. A successful HEAD
+or CI status is acted upon immediately, without waiting for the legacy
+`REVIEW_RETRY_SECONDS=600` backoff. If still pending, it polls at the configured
+interval up to the configured bound; then returns cleanly with a checkpoint.
+Reinvoke `review-run` (or schedule it) to resume. Transient failures still
+honor the existing retry backoff, and quota pauses are *not* bypassed.
+
+`--max-minutes` is a **soft** time budget checked between stages; an
+already-running Codex or Flutter subprocess can outlast it. The worker
+uses an exclusive local lock; do not run multiple schedulers concurrently.
+It never automatically approves or merges a PR or marks Jira Done.
+
+**When the review-fix limit is exhausted:** The checkpoint becomes `manual`
+and the runner stops: `Automatic review fix budget exhausted`. Inspect the
+last review's summary/inline comments (and the review JSON checkpoint).
+Do not use `review-retry` to bypass this manual stop. A human may decide
+whether the remaining findings are valid and manually fix/push a new commit.
+Only then, explicitly authorize an independent re-review:
+
+```bash
+python3 orchestrator.py review-resume SSG-8
+python3 orchestrator.py review-run --issue-key SSG-8
+```
+
+`review-resume` works **only** for a budget-exhausted manual checkpoint and
+**only** after the GitHub PR HEAD SHA changed. It does not reset the saved
+fix counters and cannot give Agent A another automatic fix round. If Agent B
+still requests changes, it returns to human intervention. Other manual stops
+(e.g., failed CI, unknown environment error, unexpected branch change) require
+investigation; they are not bypassed by this command. Preserve all existing
+`~/.codex-jira-worktrees/review/` checkpoints and worktrees during upgrade.
+
+To install, replace **both** `orchestrator.py` and `review_worker.py` with the
+matching updated versions while the scheduler is stopped, after backing up
+both files. Keep `.env` and saved state files unchanged; add the optional
+polling settings if desired.

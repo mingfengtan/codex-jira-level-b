@@ -1,12 +1,12 @@
 """Opt-in second-agent GitHub PR review/fix loop for the Jira/Codex worker.
 
-Run through `python orchestrator.py review-once`. Never merges PRs or transitions Jira Done.
+Run through `python orchestrator.py review-run` or `review-once`. Never merges PRs or transitions Jira Done.
 All provider calls go through gh CLI with the caller's existing GitHub authentication.
 """
 from __future__ import annotations
 
 import contextlib
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -55,6 +55,11 @@ def config() -> dict:
             "max_fixes": max(0, int(os.getenv("MAX_AUTO_REVIEW_FIXES", "2"))),
             "max_test_repairs": max(0, int(os.getenv("MAX_REVIEW_TEST_REPAIRS", "2"))),
             "retry_seconds": max(60, int(os.getenv("REVIEW_RETRY_SECONDS", "600"))),
+            "head_poll_seconds": max(1, int(os.getenv("REVIEW_HEAD_POLL_SECONDS", "3"))),
+            "head_wait_seconds": max(1, int(os.getenv("REVIEW_HEAD_WAIT_TIMEOUT", "120"))),
+            "ci_poll_seconds": max(1, int(os.getenv("REVIEW_CI_POLL_SECONDS", "15"))),
+            "ci_wait_seconds": max(1, int(os.getenv("REVIEW_CI_WAIT_TIMEOUT", "900"))),
+            "run_max_minutes": max(1, int(os.getenv("REVIEW_RUN_MAX_MINUTES", "90"))),
             "require_ci": os.getenv("REVIEW_REQUIRE_CI", "true").lower() == "true"}
 
 
@@ -462,6 +467,41 @@ def failed(cfg, state: dict, exc: Exception) -> None:
     persist(cfg, state)
 
 
+# A prior budget stop is recoverable by changing MAX_AUTO_REVIEW_FIXES.
+# Keep the existing review result and reviewed SHA: Agent B already reviewed
+# this commit and published findings, so rerunning B would waste model quota.
+_FIX_BUDGET_EXHAUSTED = "Automatic review fix budget exhausted"
+
+
+def can_resume_with_raised_fix_budget(state: dict, max_fixes: int) -> bool:
+    """Only restart a manual stop caused by the *old* automatic fix limit.
+
+    Other manual failures (CI, unsafe worktree, external branch changes, etc.)
+    must never be silently bypassed by a configuration update.
+    """
+    result = state.get("result")
+    return (state.get("stage") == "manual"
+            and state.get("error") == _FIX_BUDGET_EXHAUSTED
+            and isinstance(state.get("fix_rounds"), int)
+            and 0 <= state["fix_rounds"] < max_fixes
+            and isinstance(result, dict)
+            and result.get("verdict") == "changes_requested"
+            and bool(state.get("reviewed_sha"))
+            and not state.get("active_pid"))
+
+
+def resume_raised_fix_budget(cfg, state: dict, max_fixes: int) -> bool:
+    """Resume the saved reviewer findings without resetting fix history."""
+    if not can_resume_with_raised_fix_budget(state, max_fixes):
+        return False
+    prior_rounds = state["fix_rounds"]
+    stage_to(cfg, state, "fix_prepare")
+    print(f"{state['key']}: MAX_AUTO_REVIEW_FIXES raised to {max_fixes}; "
+          f"resuming Agent A from {prior_rounds} completed fix rounds, "
+          "using the saved Agent B findings", flush=True)
+    return True
+
+
 def review_once(cfg, dry_run: bool = False, already_locked: bool = False) -> None:
     if os.getenv("AUTO_REVIEW_ENABLED", "false").lower() != "true":
         print("Automated review is disabled. Set AUTO_REVIEW_ENABLED=true in scheduler .env")
@@ -478,20 +518,24 @@ def review_once(cfg, dry_run: bool = False, already_locked: bool = False) -> Non
             if core.issue_status(issue).casefold() != cfg.review_status.casefold():
                 continue  # Human merged/closed or returned work to other status.
             state = load_state(cfg, job["key"]) or create_state(cfg, job)
-            if state["stage"] == "manual":
+            resume_budget = can_resume_with_raised_fix_budget(state, config()["max_fixes"])
+            if state["stage"] == "manual" and not resume_budget:
                 continue
             if not due(state):
                 continue
             if dry_run:
-                print(f"DRY RUN: would process review for {job['key']} at {state['stage']}")
+                phase = "fix_prepare (raised fix budget)" if resume_budget else state["stage"]
+                print(f"DRY RUN: would process review for {job['key']} at {phase}")
                 return
+            if resume_budget:
+                resume_raised_fix_budget(cfg, state, config()["max_fixes"])
             persist(cfg, state)
             perform(cfg, state)
             return
         print("No review/fix work due")
 
 
-def perform(cfg, s: dict) -> None:
+def perform(cfg, s: dict, *, auto_advance: bool = False, deadline: float | None = None) -> None:
     key = s["key"]
     opts = config()
     logs = review_dir(cfg) / "logs"
@@ -511,6 +555,9 @@ def perform(cfg, s: dict) -> None:
             else:
                 raise core.WorkerError(f"Previous review process {old} may still be running", "transient")
         while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                print(f"{key}: review-run time budget reached; checkpoint saved at {s['stage']}", flush=True)
+                return
             phase = s["stage"]
             info = pr_info(cfg, repo, s["pr_number"])
             if info["head"]["ref"] != s["branch"] or info["base"]["ref"] != cfg.base_branch:
@@ -578,7 +625,8 @@ def perform(cfg, s: dict) -> None:
                     if s["fix_rounds"] >= opts["max_fixes"]:
                         raise core.WorkerError("Automatic review fix budget exhausted", "manual")
                     stage_to(cfg, s, "fix_prepare")
-                    return  # Let the next scheduled invocation run Agent A; control quota bursts.
+                    if not auto_advance:
+                        return  # Preserve review-once's historical one-step behavior.
                 else:
                     stage_to(cfg, s, "ci")
             elif phase == "fix_prepare":
@@ -629,7 +677,9 @@ def perform(cfg, s: dict) -> None:
                     print(f"{key}: application tests failed; queued repair "
                           f"{s['test_repair_attempts']}/{opts['max_test_repairs']}; "
                           f"verification log {log_path}", flush=True)
-                    return  # One Codex fix or repair session per scheduled invocation.
+                    if not auto_advance:
+                        return  # Preserve review-once's historical one-step behavior.
+                    continue  # Failed verification MUST go to repair; never commit/push.
                 s["test_failure_summary"] = None
                 stage_to(cfg, s, "fix_commit")
             elif phase == "fix_test_repair":
@@ -653,7 +703,8 @@ def perform(cfg, s: dict) -> None:
                 if not s.get("fix_completed") or not result.exists():
                     agent_run(cfg, s, path, prompt, "fix", result)
                 stage_to(cfg, s, "fix_verify")
-                return  # Avoid repeated tests / another model call in same tick.
+                if not auto_advance:
+                    return  # Preserve review-once's historical one-step behavior.
             elif phase == "fix_commit":
                 path = review_dir(cfg) / "worktrees" / f"{key}-fix"
                 # Commit only after tests pass. Never overwrite the upstream branch.
@@ -689,7 +740,8 @@ def perform(cfg, s: dict) -> None:
                 s["result"] = None
                 s["reviewed_sha"] = None
                 stage_to(cfg, s, "review")
-                return  # New PR head receives a fresh review on the next tick.
+                if not auto_advance:
+                    return  # Preserve review-once's historical one-step behavior.
             elif phase == "ci":
                 status = pr_checks(cfg, s["pr_number"]) if opts["require_ci"] else "passed"
                 if status == "pending":
@@ -697,6 +749,13 @@ def perform(cfg, s: dict) -> None:
                     return
                 if status == "failed":
                     raise core.WorkerError("GitHub CI checks failed; inspect PR and repair before proceeding", "manual")
+                # CI rollup and PR HEAD are separate reads: don't certify a stale SHA
+                # if the branch changed while CI status was being fetched.
+                if pr_info(cfg, repo, s["pr_number"])["head"]["sha"] != sha:
+                    stage_to(cfg, s, "review")
+                    s.update(review_session=None, review_completed=False, result=None, reviewed_sha=None)
+                    persist(cfg, s)
+                    continue
                 marker = f"codex-jira:{key}:ai-reviewed:{sha}"
                 jira = core.Jira(cfg)
                 if not jira.has_comment_marker(key, marker):
@@ -715,14 +774,192 @@ def perform(cfg, s: dict) -> None:
         failed(cfg, s, exc)
 
 
+def _external_wait(state: dict) -> tuple[str, str] | None:
+    """Identify safe-to-poll GitHub waits; never bypass quota/error backoff."""
+    if state.get("failure_kind"):
+        return None
+    if state.get("stage") == "recheck" and state.get("error") == "Waiting for GitHub PR head to reflect the pushed fix":
+        return ("head", "GitHub PR HEAD")
+    if state.get("stage") == "ci" and state.get("error") == "Waiting for GitHub CI checks":
+        return ("ci", "GitHub CI")
+    return None
+
+
+def _retry_delay(state: dict) -> float:
+    next_retry = state.get("next_retry_at")
+    if not next_retry:
+        return 0.0
+    return max(0.0, (datetime.fromisoformat(next_retry) - core.utcnow()).total_seconds())
+
+
+def review_run(cfg, *, issue_key: str | None = None, max_minutes: int | None = None,
+               dry_run: bool = False) -> None:
+    """Drive a single PR to passed/manual or a bounded external wait.
+
+    Unlike review-once this immediately follows cheap state transitions, fix/test
+    repair stages, and PR-HEAD/CI polling. The existing checkpoint remains the
+    durable source of truth; a terminated process can be resumed with review-run.
+    """
+    if os.getenv("AUTO_REVIEW_ENABLED", "false").lower() != "true":
+        raise ValueError("Set AUTO_REVIEW_ENABLED=true in the scheduler .env to use review-run")
+    opts = config()
+    minutes = max_minutes if max_minutes is not None else opts["run_max_minutes"]
+    if minutes <= 0:
+        raise ValueError("--max-minutes must be positive")
+    if issue_key and not core.valid_issue_key(issue_key, cfg):
+        raise ValueError(f"Invalid issue key {issue_key}")
+
+    with core.single_worker_lock(cfg.worktree_root):
+        jobs = [j for j in core.all_jobs(cfg) if j["stage"] == "complete" and j.get("pr_url")]
+        if any(j.get("failure_kind") == "quota" and j["stage"] not in {"complete", "manual"}
+               for j in core.all_jobs(cfg)):
+            print("Quota-paused coding job exists; review-run will not start new Codex sessions")
+            return
+        selected = None
+        paused = []
+        for job in jobs:
+            if issue_key and job["key"] != issue_key:
+                continue
+            issue = core.Jira(cfg).issue(job["key"])
+            if core.issue_status(issue).casefold() != cfg.review_status.casefold():
+                if issue_key:
+                    print(f"{job['key']}: Jira status is not {cfg.review_status}; skipping review")
+                    return
+                continue
+            state = load_state(cfg, job["key"]) or create_state(cfg, job)
+            resume_budget = can_resume_with_raised_fix_budget(state, opts["max_fixes"])
+            if state["stage"] == "manual" and not resume_budget:
+                if issue_key:
+                    raise core.WorkerError(f"{job['key']}: manual intervention required: {state.get('error')}", "manual")
+                continue
+            if resume_budget:
+                if dry_run:
+                    print(f"DRY RUN: {job['key']} would resume Agent A using saved review findings; "
+                          f"fixes used={state['fix_rounds']}, new limit={opts['max_fixes']}")
+                    return
+                resume_raised_fix_budget(cfg, state, opts["max_fixes"])
+            if state["stage"] == "passed":
+                # A PASS is valid only for the SHA reviewed. Never certify a newer
+                # commit solely because an old checkpoint says "passed".
+                remote = pr_info(cfg, repository_name(cfg), state["pr_number"])
+                current_sha = remote["head"]["sha"]
+                if current_sha == state.get("reviewed_sha"):
+                    if issue_key:
+                        print(f"{job['key']}: latest PR commit already passed AI review and CI; awaiting human merge")
+                        return
+                    continue
+                if dry_run:
+                    print(f"DRY RUN: {job['key']} has a new PR commit; would re-review {current_sha[:12]}")
+                    return
+                state.update(review_session=None, review_completed=False,
+                             review_running_sha=None, reviewed_sha=None, result=None)
+                stage_to(cfg, state, "review")
+            if not due(state) and not _external_wait(state):
+                paused.append((state["key"], state.get("next_retry_at")))
+                if issue_key:
+                    print(f"{job['key']}: waiting until {state.get('next_retry_at')} ({state.get('error')})")
+                    return
+                continue
+            selected = state
+            break
+        if selected is None:
+            if paused:
+                print("No eligible PR review; retry checkpoints: " + ", ".join(f"{key}={when}" for key, when in paused))
+            else:
+                print("No PR review work available" if not issue_key else f"No eligible review job for {issue_key}")
+            return
+        s = selected
+        if dry_run:
+            print(f"DRY RUN: review-run would process {s['key']} from {s['stage']}; "
+                  f"limit={minutes} min, max fixes={opts['max_fixes']}, "
+                  f"test repairs/fix={opts['max_test_repairs']}")
+            return
+
+        deadline = time.monotonic() + minutes * 60
+        wait_stage = None
+        wait_started = None
+        last_poll = None
+        print(f"{s['key']}: review-run started at {s['stage']} "
+              f"(time budget {minutes} min; human merge remains required)", flush=True)
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                print(f"{s['key']}: review-run time budget reached at {s['stage']}; "
+                      "checkpoint preserved. Run review-run again to resume.", flush=True)
+                return
+            if s["stage"] == "manual":
+                raise core.WorkerError(f"{s['key']}: human intervention required: {s.get('error')}", "manual")
+            if s["stage"] == "passed":
+                print(f"{s['key']}: AI review + CI passed; ready for human approval/merge", flush=True)
+                return
+            external = _external_wait(s)
+            if external:
+                kind, label = external
+                if wait_stage != kind:
+                    wait_stage = kind
+                    wait_started = now
+                    last_poll = None
+                limit = opts["head_wait_seconds"] if kind == "head" else opts["ci_wait_seconds"]
+                interval = opts["head_poll_seconds"] if kind == "head" else opts["ci_poll_seconds"]
+                elapsed = now - wait_started
+                if elapsed >= limit:
+                    print(f"{s['key']}: {label} still pending after {limit}s; "
+                          "checkpoint preserved. Restart review-run later; no manual retry reset needed.", flush=True)
+                    return
+                # First check immediately. Only sleep BETWEEN unsuccessful polls;
+                # CI may already be green or GitHub may already have the new HEAD.
+                if last_poll is not None:
+                    pause = min(max(0.0, interval - (now - last_poll)),
+                                float(limit) - elapsed, deadline - now)
+                    if pause > 0:
+                        print(f"{s['key']}: waiting for {label}; checking again in {pause:.0f}s", flush=True)
+                        time.sleep(pause)
+                last_poll = time.monotonic()
+            else:
+                wait_stage = None
+                wait_started = None
+                last_poll = None
+                delay = _retry_delay(s)
+                if delay > 0:
+                    # Treat quota exhaustion as a pause, not a reason to hold the
+                    # worker lock for a long time while other tickets need attention.
+                    if s.get("failure_kind") == "quota":
+                        print(f"{s['key']}: Codex quota paused until {s['next_retry_at']}; "
+                              "checkpoint preserved", flush=True)
+                        return
+                    if delay >= deadline - now:
+                        print(f"{s['key']}: retry at {s['next_retry_at']} exceeds run time budget; "
+                              "checkpoint preserved", flush=True)
+                        return
+                    print(f"{s['key']}: transient failure; retrying in {delay:.0f}s", flush=True)
+                    time.sleep(delay)
+
+            # perform() persists every stage transition and handles any errors.
+            # On GitHub waits, the explicit poll above supersedes the legacy 600s
+            # cooldown; other errors retain their saved exponential backoff.
+            perform(cfg, s, auto_advance=True, deadline=deadline)
+            if not s.get("next_retry_at") and s["stage"] not in {"manual", "passed"}:
+                # Normally perform advances to a blocking point; this also
+                # handles an overall time-budget exit without spinning.
+                if time.monotonic() >= deadline:
+                    print(f"{s['key']}: checkpoint saved at {s['stage']}", flush=True)
+                    return
+                # A retry-free return without progress indicates a logic error.
+                raise core.WorkerError(f"review-run stopped unexpectedly at {s['stage']}", "manual")
+
+
 def review_status(cfg) -> None:
     for file in sorted(review_dir(cfg).glob("*.json")):
         if not core.valid_issue_key(file.stem, cfg):
             continue
         s = load_state(cfg, file.stem)
-        print(f"{s['key']}: {s['stage']} reviews={s['review_rounds']} fixes={s['fix_rounds']} "
+        max_fixes = config()["max_fixes"]
+        extra = (" (raise-limit recovery available)"
+                 if can_resume_with_raised_fix_budget(s, max_fixes) else "")
+        print(f"{s['key']}: {s['stage']} reviews={s['review_rounds']} "
+              f"fixes={s['fix_rounds']}/{max_fixes} "
               f"test_repairs={s.get('test_repair_attempts', 0)} "
-              f"error={s.get('error')} retry={s.get('next_retry_at')}")
+              f"error={s.get('error')} retry={s.get('next_retry_at')}{extra}")
 
 
 def review_recover(cfg, key: str) -> None:
@@ -738,3 +975,33 @@ def review_recover(cfg, key: str) -> None:
     s["attempts"] = 0
     persist(cfg, s)
     print(f"{key}: retry authorized at stage={s['stage']}")
+
+
+def review_resume_after_human_push(cfg, key: str) -> None:
+    """Authorize re-review after a human has pushed a new commit to a budget-exhausted PR.
+
+    Does not reset automatic fix counters, bypass other manual failures, or merge.
+    """
+    with core.single_worker_lock(cfg.worktree_root):
+        s = load_state(cfg, key)
+        if not s:
+            raise ValueError(f"No review checkpoint for {key}")
+        if s["stage"] != "manual" or "Automatic review fix budget exhausted" not in (s.get("error") or ""):
+            raise ValueError("review-resume only applies to a PR stopped by the automatic review-fix budget")
+        prior = s.get("reviewed_sha")
+        if not prior:
+            raise ValueError("No recorded reviewed SHA; inspect the checkpoint before recovery")
+        repo = repository_name(cfg)
+        info = pr_info(cfg, repo, s["pr_number"])
+        if info["head"]["ref"] != s["branch"] or info["base"]["ref"] != cfg.base_branch:
+            raise ValueError("Unexpected PR head/base branch; investigate before resuming")
+        current = info["head"]["sha"]
+        if current == prior:
+            raise ValueError("PR HEAD has not changed. Push a human-reviewed fix first; the automatic fix budget is still exhausted")
+        s.update(stage="review", reviewed_sha=None, review_running_sha=None,
+                 review_session=None, review_completed=False, result=None,
+                 active_pid=None, human_resumed_from_sha=prior,
+                 human_resumed_to_sha=current)
+        stage_to(cfg, s, "review")
+        print(f"{key}: manual fix detected ({prior[:12]} -> {current[:12]}); "
+              f"independent re-review authorized. Automatic fix budget remains {s['fix_rounds']}", flush=True)

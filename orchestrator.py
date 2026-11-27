@@ -1462,7 +1462,13 @@ def main() -> None:
     sub.add_parser("status", help="Show durable execution checkpoints and retry times")
     review_parser = sub.add_parser("review-once", help="Process one PR review/fix checkpoint (opt-in)")
     review_parser.add_argument("--dry-run", action="store_true")
+    run_parser = sub.add_parser("review-run", help="Continuously advance one PR review through fixes, verification and CI")
+    run_parser.add_argument("--issue-key", help="Run a specific Jira ticket, e.g. SSG-8")
+    run_parser.add_argument("--max-minutes", type=int, help="Overall runner time budget; default REVIEW_RUN_MAX_MINUTES")
+    run_parser.add_argument("--dry-run", action="store_true", help="Show selected PR without executing it")
     sub.add_parser("review-status", help="Show independent AI-review checkpoints")
+    resume_parser = sub.add_parser("review-resume", help="Re-review a budget-exhausted PR after a human pushes a new commit")
+    resume_parser.add_argument("issue_key", help="Jira key, e.g. SSG-8")
     review_retry = sub.add_parser("review-retry", help="Retry a paused review checkpoint")
     review_retry.add_argument("issue_key")
     recover_parser = sub.add_parser("recover", help="Resume a paused job or adopt a pre-upgrade worktree")
@@ -1506,9 +1512,16 @@ def main() -> None:
     elif args.command == "review-once":
         import review_worker
         review_worker.review_once(cfg, dry_run=args.dry_run)
+    elif args.command == "review-run":
+        import review_worker
+        review_worker.review_run(cfg, issue_key=args.issue_key, max_minutes=args.max_minutes,
+                                 dry_run=args.dry_run)
     elif args.command == "review-status":
         import review_worker
         review_worker.review_status(cfg)
+    elif args.command == "review-resume":
+        import review_worker
+        review_worker.review_resume_after_human_push(cfg, args.issue_key)
     elif args.command == "review-retry":
         import review_worker
         review_worker.review_recover(cfg, args.issue_key)
