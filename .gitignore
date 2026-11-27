@@ -8,3 +8,4 @@ plan.applied.json
 
 # Codex event logs can contain private project details
 logs/
+review/

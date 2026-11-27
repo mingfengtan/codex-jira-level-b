@@ -94,6 +94,11 @@ python3 orchestrator.py tick --dry-run
 2. Run `python3 orchestrator.py once --dry-run` to verify selection.
 3. Run `python3 orchestrator.py once` to execute once. Or schedule `tick` every 30 minutes as shown below.
 4. The worker fetches `origin/main`, creates a new `codex/KEY` worktree, runs Codex with workspace-write sandbox, then executes `CHECK_COMMAND` **on the host**, commits with the Jira key, pushes and opens a **draft PR**. It comments with the PR URL and transitions Jira to `In Review`.
+
+**Worker progress and diagnostics:** As of this version, `once` prints each execution stage (`prepare`, `codex`, `verify`, `commit`, `push`, `pr`, `jira`, `cleanup`), Codex session/turn events, and an approximately 15-second Codex heartbeat with the number of events and time since the last event. This deliberately avoids printing model text or private source content to the terminal. The raw local Codex event stream remains in `~/.codex-jira-worktrees/logs/SSG-2.log` (substitute your Jira issue key); inspect with `tail -f`. An active process does **not** necessarily mean model progress.
+
+If `once` is already running under an older scheduler, **do not replace the Python file and start another worker**. Observe its saved state with `python3 orchestrator.py status` and its live log with `tail -f ~/.codex-jira-worktrees/logs/SSG-2.log`. Let that invocation complete, or stop/recover it deliberately, before using the updated worker. To inspect implementation changes, run `git -C ~/.codex-jira-worktrees/SSG-2 status --short`; changes do not appear in your main `ssg` checkout until the PR is merged and pulled.
+
 5. A human reviews/merges the draft PR and moves Jira ticket to `Done`. Only then should downstream tickets be approved/unblocked. Codex does not auto-merge.
 6. A parent Story/Task with Subtasks will never be executed by the worker; execute only its child Subtasks and close the parent manually after they complete. New Subtasks remain unapproved.
 
@@ -238,3 +243,102 @@ links**: that can lose the stable mapping and create duplicate Jira issues.
 The standard Jira `Blocks` link type is assumed to use the English link name
 `Blocks`. If your site customizes that link type's name or directions, adjust
 and verify the link semantics before using `--fix`.
+
+## Optional independent Agent B review / Agent A fix loop
+
+This version adds `review_worker.py` and is **opt-in**. It does not change the
+existing `plan`, `apply-plan`, `once`, or human-only PR merge workflow. First
+complete one ordinary ticket and draft PR end to end.
+
+In the **scheduler** `.env` (not the app repository), add:
+
+```dotenv
+AUTO_REVIEW_ENABLED=true
+CODEX_REVIEW_MODEL=
+CODEX_REVIEW_EFFORT=medium
+CODEX_FIX_MODEL=
+CODEX_FIX_EFFORT=medium
+MAX_AUTO_REVIEW_FIXES=2
+REVIEW_RETRY_SECONDS=600
+REVIEW_REQUIRE_CI=true
+```
+
+`CODEX_REVIEW_MODEL` and `CODEX_FIX_MODEL` are optional Codex CLI model IDs.
+Leave blank for the Codex CLI default; set different **supported** model IDs to
+make the two agents more independent. The two agents always use separate Codex
+sessions, and Agent B uses a read-only worktree. All PR writes are performed by
+the orchestrator with `gh`; the agents receive no GitHub or Jira credentials.
+
+Try read-only selection first:
+
+```bash
+python3 orchestrator.py review-once --dry-run
+```
+
+Then process one review operation:
+
+```bash
+python3 orchestrator.py review-once
+python3 orchestrator.py review-status
+```
+
+Or let the existing scheduler run one coding ticket plus at most one review/fix
+operation on each scheduled invocation:
+
+```bash
+python3 orchestrator.py tick --review
+```
+
+The review worker picks **completed coding jobs that have an open draft PR and
+whose Jira issue is still `In Review`**. It uses the committed PR head SHA for
+review identity, asks Agent B to inspect the diff and return structured findings,
+then posts GitHub `COMMENT` review notes (with inline comments only where the
+specified path/line exists in the current PR diff). If GitHub rejects review
+submission with HTTP 422 (for example, self-review restrictions), the worker
+posts the findings as an ordinary PR conversation comment instead. It does not
+approve or request changes formally, because GitHub accounts cannot approve
+their own PRs and this automated review is advisory.
+
+On blocking findings, Agent A fixes the same PR branch in an isolated worktree,
+runs `CHECK_COMMAND`, commits using the Jira key, and pushes the fix without
+force-pushing. The next scheduler invocation re-reviews the new commit.
+`MAX_AUTO_REVIEW_FIXES` limits this loop to prevent uncontrolled quota usage.
+After a passing review and required green GitHub checks, the scheduler adds a
+Jira comment and records `passed`; the PR still needs **human approval and
+merge**. It never automatically marks Jira Done. `passed` is tied to a specific
+PR SHA, so a subsequent push triggers a fresh review on the next invocation.
+If no CI checks exist, `REVIEW_REQUIRE_CI=true` keeps the review in a pending
+state; configure CI or explicitly set the option to `false` for a test setup.
+
+The worker saves checkpoints in
+`~/.codex-jira-worktrees/review/<ISSUE>.json`, separate read-only/fix worktrees
+under `review/worktrees/`, and logs in `review/logs/`. Preserve these during
+upgrades. When a review is temporarily paused, run `review-status` and review
+logs. `review-retry ISSUE-123` clears a retry cooldown but does **not** override
+manual intervention; inspect unsafe failures rather than repeatedly retrying.
+For a production deployment, provision a distinct GitHub App/bot for Agent B
+if you need an independently accountable review identity.
+
+### Hyperlinks in GitHub and Jira
+
+For newly created draft PRs, the PR description now starts with a Markdown link
+such as `[SSG-4](https://YOUR_SITE.atlassian.net/browse/SSG-4)` instead of an
+unlinked Jira ticket number. For **new Jira comments** about draft PRs or AI
+review results, the worker builds Jira Cloud ADF `link` marks, making the PR
+URL clickable inside Jira. Existing PR descriptions and existing Jira comments
+are not overwritten or re-posted just to change formatting.
+
+### Safety and current limits
+
+- The code has **offline mocked tests** but has not been executed against your
+  private GitHub and Jira accounts. Start with one expendable test PR.
+- Human review and merge remain mandatory; protect the `main` branch.
+- Review notes and model responses can be wrong. Diff-relative inline locations
+  are validated, but some findings may be relegated to the review summary.
+- Use the local GitHub CLI identity and repository permissions carefully. If
+  the PR author and review publisher are the same account, GitHub may reject a
+  formal review; the worker falls back to a normal PR comment.
+- Repeatedly failing tests, unexpected branch updates, or permissions issues
+  pause for manual intervention; they are **not** auto-merged or force-pushed.
+- Logs and saved comments contain proprietary code context. Keep the scheduler
+  state and `.env` out of version control.

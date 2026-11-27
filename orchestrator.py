@@ -104,11 +104,36 @@ class Config:
         )
 
 
-def adf(text: str) -> dict:
+def adf(text: str, *, linkify: bool = False) -> dict:
+    """Produce Jira Cloud ADF. For comments, create real clickable URL marks.
+
+    Jira REST API v3 does not automatically convert plain URL text into link
+    marks. Keep issue descriptions unchanged; linkify controller comments.
+    """
     paragraphs = []
+    url_re = re.compile(r"https://[^\s<>\[\]\(\)]+")
     for line in text.splitlines() or [text]:
-        content = [{"type": "text", "text": line[:25000]}] if line else []
-        paragraphs.append({"type": "paragraph", "content": content})
+        line = line[:25000]
+        if not line:
+            paragraphs.append({"type": "paragraph", "content": []})
+            continue
+        if not linkify:
+            nodes = [{"type": "text", "text": line}]
+        else:
+            nodes = []
+            cursor = 0
+            for found in url_re.finditer(line):
+                url = found.group(0).rstrip(".,;:!?")
+                if not url:
+                    continue
+                if found.start() > cursor:
+                    nodes.append({"type": "text", "text": line[cursor:found.start()]})
+                nodes.append({"type": "text", "text": url,
+                              "marks": [{"type": "link", "attrs": {"href": url}}]})
+                cursor = found.start() + len(url)
+            if cursor < len(line):
+                nodes.append({"type": "text", "text": line[cursor:]})
+        paragraphs.append({"type": "paragraph", "content": nodes})
     return {"type": "doc", "version": 1, "content": paragraphs or [{"type": "paragraph", "content": []}]}
 
 
@@ -185,7 +210,7 @@ class Jira:
         self.call("POST", f"/issue/{key}/transitions", {"transition": {"id": matches[0]["id"]}})
 
     def comment(self, key: str, message: str) -> None:
-        self.call("POST", f"/issue/{key}/comment", {"body": adf(message[:12000])})
+        self.call("POST", f"/issue/{key}/comment", {"body": adf(message[:12000], linkify=True)})
 
     def has_comment_marker(self, key: str, marker: str) -> bool:
         """Check existing comments so a crash during Jira sync cannot post twice."""
@@ -912,19 +937,31 @@ def terminate_group(process: subprocess.Popen) -> None:
 
 
 def run_codex_stream(cfg: Config, job: dict, prompt: str, log: Path, last_message: Path) -> None:
+    """Run Codex and journal raw events, while displaying safe high-level progress.
+
+    The terminal intentionally does not print model text, command arguments or file
+    contents: these may contain private source data. The full local log is restricted.
+    """
     worktree = Path(job["worktree"])
     args = codex_args(worktree) + ["--json", "--output-last-message", str(last_message)]
-    if job.get("session_id"):
+    is_resume = bool(job.get("session_id"))
+    if is_resume:
         args += ["resume", job["session_id"], prompt]
     else:
         args.append(prompt)
-    worktree = Path(job["worktree"])
+    print(f"{job['key']}: {'resuming' if is_resume else 'starting'} Codex in {worktree}", flush=True)
+    print(f"{job['key']}: execution log: {log} (watch: tail -f {log})", flush=True)
     proc = subprocess.Popen(args, cwd=worktree, env=safe_env(), stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
     job["active_pid"] = proc.pid
     job["active_kind"] = "codex"
     persist_job(cfg, job)
     deadline = time.monotonic() + cfg.codex_timeout
+    start = time.monotonic()
+    last_heartbeat = start
+    last_event_at = start
+    event_count = 0
+    last_event_type = "none"
     tail = bytearray()
     buffered = bytearray()
     failed_event = False
@@ -932,10 +969,17 @@ def run_codex_stream(cfg: Config, job: dict, prompt: str, log: Path, last_messag
         selector = selectors.DefaultSelector()
         with selector, log.open("ab") as output:
             output.write(f"\n--- CODEX {instant()} ---\n".encode())
+            output.flush()
             selector.register(proc.stdout, selectors.EVENT_READ)
             while True:
-                if time.monotonic() > deadline:
+                now = time.monotonic()
+                if now > deadline:
                     raise WorkerError(f"Codex timeout after {cfg.codex_timeout}s; logs: {log}", "transient")
+                if now - last_heartbeat >= 15:
+                    print(f"{job['key']}: Codex running {int(now - start)}s; "
+                          f"events={event_count}, last={last_event_type} "
+                          f"({int(now - last_event_at)}s ago)", flush=True)
+                    last_heartbeat = now
                 for _key, _mask in selector.select(timeout=0.3):
                     chunk = os.read(proc.stdout.fileno(), 65536)
                     if not chunk:
@@ -956,15 +1000,29 @@ def run_codex_stream(cfg: Config, job: dict, prompt: str, log: Path, last_messag
                             event = json.loads(raw)
                         except (ValueError, UnicodeDecodeError):
                             continue
-                        if event.get("type") == "thread.started" and event.get("thread_id"):
+                        event_type = event.get("type")
+                        if not isinstance(event_type, str):
+                            continue
+                        event_count += 1
+                        last_event_type = event_type
+                        last_event_at = time.monotonic()
+                        if event_type == "thread.started" and event.get("thread_id"):
                             new_id = event["thread_id"]
                             if job.get("session_id") != new_id:
                                 job["session_id"] = new_id
                                 persist_job(cfg, job)
-                        if event.get("type") == "turn.completed":
+                            print(f"{job['key']}: Codex session recorded", flush=True)
+                        elif event_type in {"turn.started", "turn.completed", "turn.failed", "error"}:
+                            print(f"{job['key']}: Codex {event_type}", flush=True)
+                        elif event_type in {"item.started", "item.completed", "item.updated"}:
+                            item_type = event.get("item", {}).get("type") if isinstance(event.get("item"), dict) else None
+                            # Show safe item categories; do not expose command/text/source content.
+                            if item_type in {"command_execution", "file_change"} and event_type != "item.updated":
+                                print(f"{job['key']}: Codex {event_type} ({item_type})", flush=True)
+                        if event_type == "turn.completed":
                             job["codex_complete"] = True
                             persist_job(cfg, job)
-                        if event.get("type") in {"turn.failed", "error"}:
+                        if event_type in {"turn.failed", "error"}:
                             failed_event = True
                 if proc.poll() is not None and not selector.get_map():
                     break
@@ -976,6 +1034,7 @@ def run_codex_stream(cfg: Config, job: dict, prompt: str, log: Path, last_messag
             category = classify_failure(output_text)
             raise WorkerError(f"Codex exited unsuccessfully ({proc.returncode}, event_failure={failed_event}). "
                               f"See {log}. Recent output: {output_text[-1400:]}", category)
+        print(f"{job['key']}: Codex finished successfully ({int(time.monotonic() - start)}s)", flush=True)
     except BaseException:
         terminate_group(proc)
         raise
@@ -1063,7 +1122,7 @@ def ensure_pr(cfg: Config, job: dict, title: str, last_message: Path) -> str:
         return found
     summary = last_message.read_text(encoding="utf-8")[:3500] if last_message.exists() else ""
     issue_url = f"{cfg.url}/browse/{job['key']}"
-    body = f"Jira: {issue_url}\n\nAutomated implementation; human review required.\n\n{summary}"
+    body = f"Jira issue: [{job['key']}]({issue_url})\n\nAutomated implementation; human review required.\n\n{summary}"
     result = run_command(["gh", "pr", "create", "--draft", "--base", cfg.base_branch,
                           "--head", job["branch"], "--title", f"{job['key']}: {title[:110]}",
                           "--body", body], cwd=Path(job["worktree"]), timeout=120)
@@ -1155,9 +1214,11 @@ Do NOT commit, push, open a PR, contact Jira or modify files outside this worksp
 Never access or print secrets. If ambiguous, state blockers rather than guessing.
 End with a concise summary, tests and outstanding risks.
 """
+    print(f"{key}: worker picked up ticket; stage={job['stage']}", flush=True)
     try:
         while job["stage"] not in {"complete", "manual"}:
             phase = job["stage"]
+            print(f"{key}: stage={phase}", flush=True)
             if phase == "prepare":
                 current = issue_status(issue)
                 if current.casefold() != cfg.in_progress_status.casefold():
@@ -1397,7 +1458,13 @@ def main() -> None:
     tick_parser.add_argument("--brief", type=Path, default=ROOT / "project_brief.md")
     tick_parser.add_argument("--plan", type=Path, default=ROOT / "plan.yaml")
     tick_parser.add_argument("--dry-run", action="store_true", help="Read-only; never bootstrap")
+    tick_parser.add_argument("--review", action="store_true", help="Run one AI review/fix step after regular ticket work")
     sub.add_parser("status", help="Show durable execution checkpoints and retry times")
+    review_parser = sub.add_parser("review-once", help="Process one PR review/fix checkpoint (opt-in)")
+    review_parser.add_argument("--dry-run", action="store_true")
+    sub.add_parser("review-status", help="Show independent AI-review checkpoints")
+    review_retry = sub.add_parser("review-retry", help="Retry a paused review checkpoint")
+    review_retry.add_argument("issue_key")
     recover_parser = sub.add_parser("recover", help="Resume a paused job or adopt a pre-upgrade worktree")
     recover_parser.add_argument("issue_key", help="Jira key, e.g. AIDEV-12")
     recover_parser.add_argument("--retry-now", action="store_true", help="Clear cooldown or manual stop")
@@ -1436,6 +1503,15 @@ def main() -> None:
             bootstrap(cfg, args.brief, args.plan)
     elif args.command == "status":
         show_jobs(cfg)
+    elif args.command == "review-once":
+        import review_worker
+        review_worker.review_once(cfg, dry_run=args.dry_run)
+    elif args.command == "review-status":
+        import review_worker
+        review_worker.review_status(cfg)
+    elif args.command == "review-retry":
+        import review_worker
+        review_worker.review_recover(cfg, args.issue_key)
     elif args.command == "recover":
         recover_job(cfg, args.issue_key, retry_now=args.retry_now, adopt_worktree=args.adopt_worktree)
     elif args.command == "tick":
@@ -1443,6 +1519,9 @@ def main() -> None:
             if args.bootstrap and not args.dry_run:
                 bootstrap(cfg, args.brief, args.plan)
             once(cfg, dry_run=args.dry_run, already_locked=True)
+            if args.review:
+                import review_worker
+                review_worker.review_once(cfg, dry_run=args.dry_run, already_locked=True)
 
 
 if __name__ == "__main__":
